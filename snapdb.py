@@ -302,7 +302,7 @@ class SnapDB:
         if self._rows_per_slab < 1:
             raise ValueError(f"Row size ({schema.row_width}) exceeds page size ({page_size})")
 
-        if self.path.exists():
+        if self.path.exists() and self.path.stat().st_size >= _HEADER_SIZE:
             self._load()
         else:
             self._create()
@@ -332,6 +332,10 @@ class SnapDB:
 
     def _load(self) -> None:
         """Load existing database file."""
+        file_size = os.path.getsize(self.path)
+        if file_size < _HEADER_SIZE:
+            raise ValueError(f"File too small ({file_size} bytes) — not a valid SnapDB")
+
         self._file = open(self.path, "r+b")
         self._mm = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_WRITE)
 
