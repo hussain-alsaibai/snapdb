@@ -28,6 +28,18 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from contextlib import contextmanager
+
+# v0.2.0 imports (optional — gracefully degrade if not present)
+try:
+    from index import HashIndex, MultiIndex
+except ImportError:
+    HashIndex = None  # type: ignore
+    MultiIndex = None  # type: ignore
+try:
+    from wal import WAL
+except ImportError:
+    WAL = None  # type: ignore
 
 
 # ── Type Mapping ───────────────────────────────────────────────────────────────
@@ -140,12 +152,12 @@ class Schema:
                 parts.append(struct.pack(f"<{_struct_code(col.dtype)}", val))
         return b"".join(parts)
 
-    def decode_row(self, buf: bytes) -> Dict[str, Any]:
+    def decode_row(self, buf: Union[bytes, memoryview]) -> Dict[str, Any]:
         """Unpack binary row into dict."""
         row: Dict[str, Any] = {}
         for col in self.columns:
             off = self.offset(col.name)
-            raw = buf[off : off + col.width]
+            raw = bytes(buf[off : off + col.width])
             if col.dtype == "bool":
                 row[col.name] = struct.unpack("?", raw)[0]
             elif col.dtype.startswith("bytes"):
@@ -276,6 +288,17 @@ class SnapDB:
         self._mm: Optional[mmap.mmap] = None
         self._file: Optional[BinaryIO] = None
 
+        # v0.2.0: transaction state tracking
+        self._in_tx = False
+        self._tx_state: List[Tuple[str, int, Optional[Dict]]] = []
+        self._indexes: Optional["MultiIndex"] = None
+        self._wal: Optional["WAL"] = None
+        if MultiIndex is not None:
+            self._indexes = MultiIndex()
+        if WAL is not None:
+            wal_path = str(self.path).replace(".snap", ".wal")
+            self._wal = WAL(wal_path)
+
         if self._rows_per_slab < 1:
             raise ValueError(f"Row size ({schema.row_width}) exceeds page size ({page_size})")
 
@@ -375,12 +398,25 @@ class SnapDB:
                 local_idx = slab.insert(row)
                 global_idx = slab_idx * self._rows_per_slab + local_idx
                 self._total_rows += 1
+                self._on_insert(row, global_idx)
                 return global_idx
         # All slabs full — expand
         self._expand()
-        slab = self._slabs[-1]
-        local_idx = slab.insert(row)
-        return (len(self._slabs) - 1) * self._rows_per_slab + local_idx
+        idx = self._slabs[-1].insert(row)
+        global_idx = (len(self._slabs) - 1) * self._rows_per_slab + idx
+        self._total_rows += 1
+        self._on_insert(row, global_idx)
+        return global_idx
+
+    def _on_insert(self, row: Dict[str, Any], global_idx: int) -> None:
+        """v0.2.0: update indexes, WAL, and transaction state."""
+        if self._indexes is not None:
+            for idx_obj in self._indexes._indexes.values():
+                idx_obj.insert(global_idx, row)
+        if self._wal is not None:
+            self._wal.append("insert", row=row)
+        if self._in_tx:
+            self._tx_state.append(("insert", global_idx, None))
 
     def get(self, idx: int) -> Optional[Dict[str, Any]]:
         """Get row as decoded dict."""
@@ -404,7 +440,19 @@ class SnapDB:
         local_idx = idx % self._rows_per_slab
         if slab_idx >= len(self._slabs):
             raise KeyError(f"Row {idx} not found")
+
+        # v0.2.0: update indexes + WAL + tx tracking
+        old_row = self._slabs[slab_idx].get(local_idx)
         self._slabs[slab_idx].update(local_idx, row)
+        if self._indexes is not None and old_row is not None:
+            for idx_obj in self._indexes._indexes.values():
+                idx_obj.update(idx, old_row, row)
+        if self._wal is not None:
+            self._wal.append("update", idx=idx, row=row)
+        if self._in_tx and old_row is not None:
+            self._tx_state.append(("update", idx, old_row))
+        if self._in_tx:
+            self._tx_rows.add(idx)
 
     def delete(self, idx: int) -> None:
         """Delete row (lazy)."""
@@ -412,8 +460,20 @@ class SnapDB:
         local_idx = idx % self._rows_per_slab
         if slab_idx >= len(self._slabs):
             raise KeyError(f"Row {idx} not found")
+
+        # v0.2.0: update indexes + WAL + tx tracking
+        old_row = self._slabs[slab_idx].get(local_idx)
         self._slabs[slab_idx].delete(local_idx)
         self._total_rows -= 1
+        if self._indexes is not None and old_row is not None:
+            for idx_obj in self._indexes._indexes.values():
+                idx_obj.delete(idx, old_row)
+        if self._wal is not None:
+            self._wal.append("delete", idx=idx)
+        if self._in_tx and old_row is not None:
+            self._tx_state.append(("delete", idx, old_row))
+        if self._in_tx:
+            self._tx_rows.add(idx)
 
     def __iter__(self) -> Iterator[Tuple[int, Dict[str, Any]]]:
         """Iterate all live rows: (global_idx, row_dict)."""
@@ -446,7 +506,6 @@ class SnapDB:
 
     def close(self) -> None:
         """Close the database."""
-        # Force garbage collection to release memoryview references
         import gc
         gc.collect()
         if self._mm:
@@ -454,17 +513,135 @@ class SnapDB:
             try:
                 self._mm.close()
             except BufferError:
-                pass  # memoryview still referenced somewhere
+                pass
             self._mm = None
         if self._file:
             self._file.close()
             self._file = None
+        if self._wal is not None:
+            self._wal.close()
 
-    def __enter__(self):
-        return self
+    def _tx_begin(self) -> None:
+        """Start tracking transaction changes."""
+        self._in_tx = True
+        self._tx_state = []
 
-    def __exit__(self, *args):
-        self.close()
+    def _tx_end(self) -> None:
+        """End transaction tracking."""
+        self._in_tx = False
+        self._tx_state = []
+
+    def _tx_rollback(self) -> None:
+        """Rollback current transaction by reversing all tracked operations."""
+        if not self._in_tx:
+            return
+        # Reverse operations in reverse order (LIFO)
+        for op, idx, data in reversed(self._tx_state):
+            if op == "insert":
+                # Undo insert: delete the row
+                self._raw_delete(idx)
+            elif op == "update":
+                # Undo update: restore old data
+                self._raw_update(idx, data)
+            elif op == "delete":
+                # Undo delete: re-insert old data
+                self._raw_insert(idx, data)
+        self._tx_end()
+        if self._wal is not None:
+            self._wal._buffer.clear()
+
+    def _raw_delete(self, idx: int) -> None:
+        """Internal: delete without tracking."""
+        slab_idx = idx // self._rows_per_slab
+        local_idx = idx % self._rows_per_slab
+        if slab_idx < len(self._slabs):
+            self._slabs[slab_idx].delete(local_idx)
+            self._total_rows -= 1
+
+    def _raw_update(self, idx: int, row: Dict[str, Any]) -> None:
+        """Internal: update without tracking."""
+        slab_idx = idx // self._rows_per_slab
+        local_idx = idx % self._rows_per_slab
+        if slab_idx < len(self._slabs):
+            self._slabs[slab_idx].update(local_idx, row)
+
+    def _raw_insert(self, idx: int, row: Dict[str, Any]) -> None:
+        """Internal: re-insert without tracking (at specific idx, not append)."""
+        slab_idx = idx // self._rows_per_slab
+        local_idx = idx % self._rows_per_slab
+        if slab_idx < len(self._slabs) and local_idx < self._slabs[slab_idx]._capacity:
+            raw = self.schema.encode_row(row)
+            start = self._slabs[slab_idx]._row_offset(local_idx)
+            mv = memoryview(self._mm)[start : start + len(raw)]
+            mv[:] = raw
+            self._slabs[slab_idx]._live[local_idx] = 1
+            self._total_rows += 1
+
+    def create_index(self, column: str) -> None:
+        """Create a hash index on a column."""
+        if self._indexes is None:
+            raise RuntimeError("Indexing not available (index.py missing)")
+        if column in self._indexes:
+            return  # Already exists
+        self._indexes.create(column)
+        # Index existing rows
+        for idx, row in self:
+            self._indexes._indexes[column].insert(idx, row)
+
+    def drop_index(self, column: str) -> None:
+        """Drop a hash index."""
+        if self._indexes is not None and column in self._indexes:
+            self._indexes.drop(column)
+
+    def find(self, **kwargs) -> List[Dict[str, Any]]:
+        """Find rows by indexed column(s). Returns list of matching rows."""
+        if self._indexes is None:
+            raise RuntimeError("Indexing not available")
+        row_indices = self._indexes.lookup(**kwargs)
+        if row_indices is None:
+            return []
+        return [self.get(i) for i in row_indices]
+
+    # ── v0.2.0: Transactions ──────────────────────────────────────────────────
+
+    @contextmanager
+    def transaction(self):
+        """Transaction context manager.
+
+        Usage:
+            with db.transaction():
+                db.insert({...})
+                db.update(0, {...})
+                # auto-commit on success, rollback on exception
+        """
+        if self._wal is None:
+            raise RuntimeError("WAL not available (wal.py missing)")
+        self._wal.begin()
+        self._tx_begin()
+        try:
+            yield self
+            self._wal.commit()
+            self._tx_end()
+        except Exception:
+            self._wal.rollback()
+            self._tx_rollback()
+            raise
+
+    def checkpoint(self) -> None:
+        """Checkpoint WAL — clear after successful operations."""
+        if self._wal is not None:
+            self._wal.clear()
+
+    # ── v0.2.0: Query Engine ──────────────────────────────────────────────────
+
+    def select(self, **conditions) -> "Query":
+        """Start a query (requires query.py)."""
+        try:
+            from query import query as _query
+            return _query(self).filter(**conditions)
+        except ImportError:
+            raise RuntimeError("Query engine not available (query.py missing)")
 
     def __repr__(self) -> str:
-        return f"SnapDB({self.path!r}, rows={self._total_rows}, slabs={len(self._slabs)})"
+        indexes = list(self._indexes._indexes.keys()) if self._indexes else []
+        return f"SnapDB({self.path!r}, rows={self._total_rows}, slabs={len(self._slabs)}, indexes={indexes})"
