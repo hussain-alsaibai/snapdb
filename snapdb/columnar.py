@@ -1,6 +1,6 @@
 """
 Columnar storage engine for SnapDB.
-Inspired by ClickHouse columnar layout for analytical workloads.
+A column-oriented storage layout for analytical workloads.
 Zero-dependency, pure Python.
 
 v0.3.1: Optimized batch operations, precomputed column lists, faster iteration.

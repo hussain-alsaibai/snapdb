@@ -31,7 +31,7 @@ pip install snapdb
 
 ## Key Innovations
 
-- **Columnar engine** — ClickHouse-inspired per-column `array.array` storage; full-scan aggregation **~3× faster than SQLite** at a fraction of the memory
+- **Columnar engine** — column-oriented per-column `array.array` storage; full-scan aggregation **~3× faster than SQLite** at a fraction of the memory
 - **Lowest memory footprint of the field** — ~2.2 MB / 100K rows vs SQLite 2.9 MB, pandas 11 MB, plain `dict` 22 MB ([benchmarks](#benchmarks))
 - **Vectorized multi-condition filters** *(v0.6.0)* — `select_where()` combines per-column bitmasks with C-speed big-integer `AND`/`OR` (**~2× faster** selective `WHERE`)
 - **O(1) delta-encoded reads** *(v0.6.0)* — lazy reconstruction cache turns delta scans from O(n²) into O(n) (orders of magnitude faster)
@@ -271,7 +271,7 @@ memory wins for low-cardinality / monotonic columns are shown above.
 ```
 SnapDB
 ├── core.py          — Slab storage, Schema, CRUD, WAL
-├── columnar.py      — ClickHouse-inspired columnar engine
+├── columnar.py      — column-oriented analytical engine
 ├── metrics.py       — Prometheus-style metrics collector
 ├── index.py         — Hash + multi-column indexes
 ├── query.py         — SQL-like query builder
