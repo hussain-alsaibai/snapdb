@@ -624,10 +624,16 @@ class SnapDB:
                 continue
             chunk = remaining[:space]
             local_start = slab.batch_insert(chunk)
-            if has_indexes:
+            if has_indexes or self._in_tx:
                 base = slab_idx * self._rows_per_slab + local_start
                 for offset, row in enumerate(chunk):
-                    self._index_insert(base + offset, row)
+                    gidx = base + offset
+                    if has_indexes:
+                        self._index_insert(gidx, row)
+                    # Record undo state so a batch inside transaction() rolls
+                    # back like single inserts do (atomicity).
+                    if self._in_tx:
+                        self._tx_state.append(("insert", gidx, dict(row)))
             self._total_rows += len(chunk)
             total_inserted += len(chunk)
             remaining = remaining[space:]
