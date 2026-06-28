@@ -31,7 +31,8 @@ pip install snapdb
 
 ## Key Innovations
 
-- **Columnar engine** — column-oriented per-column `array.array` storage; full-scan aggregation **~3× faster than SQLite** at a fraction of the memory
+- **Columnar engine** — column-oriented per-column `array.array` storage; full-scan aggregation **~27× faster than SQLite** at a fraction of the memory
+- **NumPy-accelerated aggregates** *(optional, v0.8.0)* — when NumPy is installed, `aggregate()` runs over the zero-copy column buffer (**~530M rows/s**, on par with pandas); pure-Python remains the zero-dependency default
 - **Lowest memory footprint of the field** — ~2.2 MB / 100K rows vs SQLite 2.9 MB, pandas 11 MB, plain `dict` 22 MB ([benchmarks](#benchmarks))
 - **Vectorized multi-condition filters** *(v0.6.0)* — `select_where()` combines per-column bitmasks with C-speed big-integer `AND`/`OR` (**~2× faster** selective `WHERE`)
 - **O(1) delta-encoded reads** *(v0.6.0)* — lazy reconstruction cache turns delta scans from O(n²) into O(n) (orders of magnitude faster)
@@ -265,27 +266,28 @@ python benchmarks/bench_suite.py --rows 100000 --markdown bench.md
 ```
 
 <!-- BENCH:START -->
-_100,000 rows · 50,000 point reads · best of 5 · Python 3.13 · win32. Higher is better except Memory (lower is better)._
+_100,000 rows · 50,000 point reads · best of 5 · Python 3.13 · win32 (NumPy installed → accelerated aggregate). Higher is better except Memory (lower is better)._
 
 | Workload | Unit | SnapDB (columnar) | SnapDB (row) | sqlite3 (:memory:) | pandas | dict (baseline) |
 |---|---|---|---|---|---|---|
-| Bulk insert | rows/s | 495,686 | 11,272 | 880,002 | 644,053 | 13,361,839 |
-| Point read (PK) | ops/s | 87,143 | 80,707 | 332,141 | 31,832 | 5,557,902 |
-| Full scan + SUM | rows/s | 58,685,446 | 447,746 | 17,566,048 | 522,193,203 | 17,217,038 |
-| 3-cond filter | rows/s | 1,146,387 | 430,743 | 11,147,775 | 20,052,136 | 14,388,903 |
+| Bulk insert | rows/s | 467,309 | 11,173 | 770,788 | 794,461 | 11,139,083 |
+| Point read (PK) | ops/s | 86,243 | 87,836 | 370,698 | 32,296 | 5,494,807 |
+| Full scan + SUM | rows/s | 529,660,985 | 483,067 | 19,910,403 | 513,874,544 | 19,488,619 |
+| 3-cond filter | rows/s | 1,205,272 | 470,223 | 11,842,168 | 19,827,894 | 13,811,773 |
 | Memory footprint | MB | 2.2 | n/a | 2.9 | 11.0 | 22.5 |
 <!-- BENCH:END -->
 
 **Where SnapDB wins (honestly):**
 
 - **Memory** — the columnar store is the **lightest** here: ~5× smaller than pandas and ~10× smaller than a plain `dict`, with zero dependencies.
-- **Full-scan aggregation** — **~3.3× faster than in-memory SQLite** and ~3.4× faster than a `dict` loop, thanks to contiguous `array.array` columns and array-level reductions.
+- **Full-scan aggregation** — **on par with pandas (~530M rows/s)** and ~27× faster than in-memory SQLite. With NumPy installed, `aggregate()` runs over the zero-copy column buffer (issue #14); without NumPy the pure-Python path still does ~58M rows/s (~3× SQLite).
 - **Embeddable** — a single mmap-backed file, no server, no C extensions.
 
-**Where it doesn't (also honestly):** a NumPy-backed engine (pandas) wins pure
-vectorized math, and SQLite's B-tree wins indexed point reads. SnapDB targets
-the lightweight-embedded-analytics niche, not raw SIMD throughput. Encoding
-memory wins for low-cardinality / monotonic columns are shown above.
+**Where it doesn't (also honestly):** pandas still wins multi-condition
+filtering (vectorized `WHERE` acceleration is the next item, [#14](https://github.com/hussain-alsaibai/snapdb/issues/14)), and SQLite's
+B-tree wins indexed point reads. SnapDB targets the lightweight-embedded-
+analytics niche. Encoding memory wins for low-cardinality / monotonic columns
+are shown above.
 
 > CI runs this suite on every push and publishes a fresh table to the workflow
 > run summary (Actions → CI → Benchmark).
@@ -349,6 +351,10 @@ on Linux (3.9–3.13) and Windows, and the benchmark on every push and PR.
 
 ## Version History
 
+- **v0.8.0** — Optional NumPy-accelerated aggregates ([#14](https://github.com/hussain-alsaibai/snapdb/issues/14)):
+  - `aggregate()` runs `sum`/`min`/`max`/`avg` over the zero-copy column buffer with NumPy when it's installed — **~13–27× faster** (full-scan SUM ~530M rows/s, on par with pandas)
+  - Auto-enabled when NumPy is present; `use_numpy=False` forces the pure-Python path; exact parity verified (integers exact, floats within tolerance)
+  - Zero-dependency default unchanged; encoded (delta/FOR) and 64-bit-int-sum cases fall through to the exact Python path
 - **v0.7.0** — Frame-of-Reference encoding:
   - **New:** Frame-of-Reference (FOR) + bit packing for bounded numeric columns (ages, scores, ratings): **4–8× memory reduction**
   - Auto-detects after sampling threshold (default 50 rows), auto-fallback when range exceeds 16 bits
