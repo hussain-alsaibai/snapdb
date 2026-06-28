@@ -43,11 +43,9 @@ _TYPE_SIZES = {
 # Numeric types eligible for delta encoding
 _DELTA_ELIGIBLE = {"i32", "i64", "u32", "u64"}
 
-# Numeric types eligible for Frame-of-Reference encoding
+# Integer types eligible for Frame-of-Reference (FOR) encoding. Restricted to
+# the wider types where 16-bit packing yields a real (>=50%) space win.
 _FOR_ELIGIBLE = {"i32", "i64", "u32", "u64"}
-
-# Integer types eligible for Frame-of-Reference (FOR) encoding
-_FOR_ELIGIBLE = {"i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"}
 
 # array.array typecode -> NumPy dtype string, for zero-copy export (PEP 688 / #7)
 _NUMPY_DTYPE = {
@@ -292,11 +290,28 @@ class Column:
         self._delta_typecode = new_tc
 
     def _start_for_mode(self) -> None:
-        """Switch to Frame-of-Reference bit-packing mode."""
+        """Switch to Frame-of-Reference bit-packing mode.
+
+        Derive the base (min) and bit-width from the actual data being packed
+        rather than from the sampling stats — the two can differ (e.g. a column
+        that is both delta- and FOR-encoded falls back from delta and then only
+        samples the *post-fallback* values, while ``_data`` still holds the
+        earlier rows). Packing with a too-narrow width would silently corrupt
+        those rows, so if the real range doesn't fit in 16 bits we stay raw.
+        """
+        old_data = list(self._data)
+        if old_data:
+            self._for_min = min(old_data)
+            range_val = max(old_data) - self._for_min
+        else:
+            self._for_min = self._for_stats["min"] if self._for_stats else 0
+            range_val = 0
+        if range_val.bit_length() > 16:
+            # No real space win — keep raw storage.
+            self._for_fallback = True
+            self._for_stats = None
+            return
         self._for_mode = True
-        self._for_min = self._for_stats["min"]
-        max_val = self._for_stats["max"]
-        range_val = max_val - self._for_min
         if range_val <= 0:
             # All values identical - use 1 bit per value (0)
             self._for_bits = 1
@@ -309,7 +324,6 @@ class Column:
         self._for_packed = 0  # Python int bitmask for packed values
         self._for_count = 0
         # Convert existing raw data to FOR packed format
-        old_data = list(self._data)
         self._data = array.array(_array_typecode(self.dtype))
         for v in old_data:
             self._append_for(v)
@@ -327,6 +341,25 @@ class Column:
         bit_pos = idx * self._for_bits
         delta = (self._for_packed >> bit_pos) & self._for_mask
         return self._for_min + delta
+
+    def _widen_for(self, needed_delta: int) -> bool:
+        """Repack the FOR column with enough bits to hold ``needed_delta``.
+
+        Returns True if widening kept FOR worthwhile (<=16 bits, so still a
+        space win for i32/i64); otherwise converts to raw and returns False.
+        """
+        new_bits = max(1, needed_delta.bit_length())
+        if new_bits > 16:
+            self._convert_for_to_raw()
+            return False
+        old_vals = [self._get_for_value(i) for i in range(self._for_count)]
+        self._for_bits = new_bits
+        self._for_mask = (1 << new_bits) - 1
+        self._for_packed = 0
+        self._for_count = 0
+        for v in old_vals:
+            self._append_for(v)
+        return True
 
     def _convert_for_to_raw(self) -> None:
         """Convert from FOR mode back to raw storage."""
@@ -384,6 +417,10 @@ class Column:
             elif self._delta_mode and not self._delta_fallback:
                 self._deltas.append(0)
                 self._delta_cache = None  # invalidate reconstruction cache
+            elif self._for_mode and not self._for_fallback:
+                # Pack a placeholder so _for_count stays aligned with the row
+                # index; the value is hidden by the nullmask anyway.
+                self._append_for(self._for_min)
             else:
                 self._data.append(0 if self._data.typecode not in ("f", "d") else 0.0)
         else:
@@ -460,8 +497,22 @@ class Column:
                             self._for_fallback = True
                             self._for_stats = None
                 else:
-                    # Already in FOR mode
-                    self._append_for(value)
+                    # Already in FOR mode. A value outside the packable range
+                    # [min, min + mask] would be silently truncated by the mask.
+                    # Above the range: widen the bit-width (still compressed) and
+                    # fall back to raw only past 16 bits. Below min: rebasing is
+                    # expensive, so fall back to raw.
+                    delta = value - self._for_min
+                    if delta < 0:
+                        self._convert_for_to_raw()
+                        self._data.append(value)
+                    elif delta > self._for_mask:
+                        if self._widen_for(delta):
+                            self._append_for(value)
+                        else:
+                            self._data.append(value)
+                    else:
+                        self._append_for(value)
             else:
                 self._data.append(value)
 
@@ -505,6 +556,10 @@ class Column:
             elif self._delta_mode and not self._delta_fallback:
                 # Delta values are cumulative — zeroing a delta would shift every
                 # later row. Leave the chain intact; the nullmask hides this row.
+                pass
+            elif self._for_mode and not self._for_fallback:
+                # FOR values are bit-packed and _data is empty; leave the packed
+                # value intact (the nullmask hides this row).
                 pass
             else:
                 self._data[idx] = 0.0 if self._data.typecode in ("f", "d") else 0
@@ -609,6 +664,7 @@ class Column:
             and self.dtype != "bool"
             and not (self._dict_mode and not self._dict_fallback)
             and not (self._delta_mode and not self._delta_fallback)
+            and not (self._for_mode and not self._for_fallback)
         )
 
     def buffer(self) -> memoryview:
@@ -681,16 +737,13 @@ class Column:
         """Return number of unique non-null values in this column."""
         if self._dict_mode and not self._dict_fallback:
             return len(self._dict_values)
-        if self.dtype.startswith("bytes"):
-            seen = set()
-            for i in range(len(self._nullmask)):
-                if not self._nullmask[i]:
-                    seen.add(self._data[i])
-            return len(seen)
+        # Read through the value accessor so encoded columns (delta / FOR, whose
+        # raw _data array is empty) reconstruct correctly instead of IndexError-ing.
+        nullmask = self._nullmask
         seen = set()
-        for i in range(len(self._nullmask)):
-            if not self._nullmask[i]:
-                seen.add(self._data[i])
+        for i in range(len(nullmask)):
+            if not nullmask[i]:
+                seen.add(self[i])
         return len(seen)
 
 

@@ -13,10 +13,12 @@ Expected behavior:
 
 from __future__ import annotations
 
+import os
 import sys
-sys.path.insert(0, "snapdb")
 
-from snapdb.columnar import Column, ColumnarTable
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from snapdb.columnar import Column, ColumnarTable  # noqa: E402
 
 
 def test_for_threshold_sampling():
@@ -138,6 +140,112 @@ def test_for_update_fallback():
     print("✅ test_for_update_fallback")
 
 
+def test_for_out_of_range_after_activation():
+    """A value outside the sampled range must NOT be silently truncated."""
+    col = Column("age", "i32", for_encode=True, for_threshold=50)
+    for i in range(60):
+        col.append(20 + (i % 21))          # 20..40 -> FOR enabled, narrow bits
+    assert col._for_mode
+    col.append(200)                         # above range: widen, stay correct
+    assert col[col.__len__() - 1] == 200
+    col.append(-5)                          # below min: falls back to raw
+    assert col[col.__len__() - 1] == -5
+    # everything still reads back correctly
+    for i in range(60):
+        assert col[i] == 20 + (i % 21)
+    print("✅ test_for_out_of_range_after_activation")
+
+
+def test_for_widening_keeps_compression():
+    """Monotonic growth widens the bit-width instead of corrupting/raw-falling."""
+    col = Column("v", "i32", for_encode=True, for_threshold=50)
+    for v in range(100, 200):
+        col.append(v)
+    assert col._for_mode and not col._for_fallback
+    assert all(col[i] == 100 + i for i in range(100))
+    raw = Column("v", "i32")
+    for v in range(100, 200):
+        raw.append(v)
+    assert col.memory_usage() < raw.memory_usage()
+    print("✅ test_for_widening_keeps_compression")
+
+
+def test_for_nulls_after_activation():
+    """Nulls appended after FOR mode is active must not desync the packing."""
+    col = Column("x", "i32", for_encode=True, for_threshold=30)
+    for i in range(40):
+        col.append(1000 + (i % 30))         # FOR active by now
+    col.append(None)
+    col.append(1005)
+    assert col[40] is None
+    assert col[41] == 1005
+    assert all(col[i] == 1000 + (i % 30) for i in range(40))
+    print("✅ test_for_nulls_after_activation")
+
+
+def test_for_to_numpy_and_buffer():
+    """to_numpy() must materialize FOR values; buffer() must refuse FOR."""
+    import importlib.util
+    if importlib.util.find_spec("numpy") is None:
+        print("⏭  numpy not installed; skipping FOR numpy test")
+        return
+    t = ColumnarTable("t", [("x", "i32")], for_columns=["x"])
+    t.batch_insert([{"x": 1000 + (i % 50)} for i in range(60)])
+    assert t.columns["x"]._for_mode
+    arr = t.to_numpy("x")
+    assert len(arr) == 60
+    assert int(arr.sum()) == sum(1000 + (i % 50) for i in range(60))
+    try:
+        t.column_buffer("x")
+        raise AssertionError("column_buffer should raise for an encoded column")
+    except TypeError:
+        pass
+    print("✅ test_for_to_numpy_and_buffer")
+
+
+def test_for_update_to_none():
+    """update()/__setitem__ setting a FOR value to None must null it, not crash."""
+    t = ColumnarTable("t", [("id", "i64"), ("v", "i64")], for_columns=["v"],
+                      for_threshold=5)
+    for i in range(8):
+        t.insert({"id": i, "v": 1000 + i})
+    assert t.columns["v"]._for_mode
+    t.update(3, {"v": None})            # used to raise IndexError
+    row = t.get(3)
+    assert row is not None and row["v"] is None
+    assert t.get(2)["v"] == 1002 and t.get(4)["v"] == 1004  # neighbors intact
+    print("✅ test_for_update_to_none")
+
+
+def test_for_with_delta_combination_no_corruption():
+    """A column requested as both delta- and FOR-encoded must not corrupt rows
+    when delta falls back and FOR then activates on a subset of samples."""
+    t = ColumnarTable("t", [("x", "i64")], delta_columns=["x"], for_columns=["x"])
+    col = t.columns["x"]
+    vals = [3000] * 49 + [1] + [5000 + (i % 4) for i in range(60)]
+    for v in vals:
+        t.insert({"x": v})
+    assert col.tolist() == vals          # every row reconstructs correctly
+    assert t.aggregate("x", "min") == min(vals)
+    assert t.aggregate("x", "sum") == sum(vals)
+    print("✅ test_for_with_delta_combination_no_corruption")
+
+
+def test_for_unique_count():
+    """unique_count() must reconstruct FOR/delta values, not index empty _data."""
+    c = Column("u", "i32", for_encode=True, for_threshold=3)
+    for v in [100, 101, 102, 100, 103, 101]:
+        c.append(v)
+    assert c._for_mode
+    assert c.unique_count() == 4              # {100,101,102,103}
+    d = Column("t", "i64", delta_encode=True, delta_samples=3)
+    for v in [10, 20, 30, 40, 50, 50]:
+        d.append(v)
+    assert d._delta_mode
+    assert d.unique_count() == 5
+    print("✅ test_for_unique_count")
+
+
 if __name__ == "__main__":
     test_for_threshold_sampling()
     test_for_memory_reduction()
@@ -145,4 +253,11 @@ if __name__ == "__main__":
     test_for_with_nulls()
     test_for_table_integration()
     test_for_update_fallback()
+    test_for_out_of_range_after_activation()
+    test_for_widening_keeps_compression()
+    test_for_nulls_after_activation()
+    test_for_to_numpy_and_buffer()
+    test_for_update_to_none()
+    test_for_with_delta_combination_no_corruption()
+    test_for_unique_count()
     print("\n✅ All FOR encoding tests passed!")

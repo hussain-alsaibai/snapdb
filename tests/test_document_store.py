@@ -20,6 +20,10 @@ def test_basic_insert_get():
         assert row["age"] == 30
         print("✅ basic insert/get")
     finally:
+        try:
+            db.close()
+        except Exception:
+            pass
         if os.path.exists(path):
             os.unlink(path)
 
@@ -54,6 +58,10 @@ def test_query():
 
         print("✅ query")
     finally:
+        try:
+            db.close()
+        except Exception:
+            pass
         if os.path.exists(path):
             os.unlink(path)
 
@@ -87,6 +95,10 @@ def test_select_sort_limit():
 
         print("✅ select/sort/limit")
     finally:
+        try:
+            db.close()
+        except Exception:
+            pass
         if os.path.exists(path):
             os.unlink(path)
 
@@ -109,6 +121,10 @@ def test_update_delete():
 
         print("✅ update/delete")
     finally:
+        try:
+            db.close()
+        except Exception:
+            pass
         if os.path.exists(path):
             os.unlink(path)
 
@@ -135,6 +151,11 @@ def test_json_export_import():
 
         print("✅ JSON export/import")
     finally:
+        for _name in ("db", "db2"):
+            try:
+                locals()[_name].close()
+            except Exception:
+                pass
         for p in [path, json_path, json_path.replace(".json", "2.snap")]:
             if os.path.exists(p):
                 os.unlink(p)
@@ -154,6 +175,10 @@ def test_count():
         assert len(db) == 2
         print("✅ count")
     finally:
+        try:
+            db.close()
+        except Exception:
+            pass
         if os.path.exists(path):
             os.unlink(path)
 

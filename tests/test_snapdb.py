@@ -53,6 +53,7 @@ def test_row_crud():
         # Get raw
         raw = db.get_raw(0)
         test("get_raw returns memoryview", isinstance(raw, memoryview) or raw is None, str(type(raw)))
+        raw = None  # release the mmap view so close()/cleanup can unmap (Windows)
 
         # Update
         db.update(1, {"score": 90.0})
