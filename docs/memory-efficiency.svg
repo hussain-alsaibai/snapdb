@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 300" width="720" height="300" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-label="Memory footprint for 100,000 rows: SnapDB columnar 2.2 MB, sqlite3 in-memory 2.9 MB, pandas 11.0 MB, dict baseline 22.5 MB. Lower is better.">
+  <rect x="0.5" y="0.5" width="719" height="299" rx="12" fill="#ffffff" stroke="#e5e7eb"/>
+
+  <text x="32" y="40" font-size="19" font-weight="700" fill="#0f172a">Memory footprint &#8212; 100,000 rows</text>
+  <text x="32" y="62" font-size="13" fill="#64748b">Lower is better &#183; pure-Python, zero dependencies</text>
+
+  <!-- SnapDB (columnar) — 2.2 MB -->
+  <text x="150" y="114" font-size="13" fill="#334155" text-anchor="end">SnapDB (columnar)</text>
+  <rect x="160" y="92" width="45" height="34" rx="4" fill="#16a34a"/>
+  <text x="215" y="114" font-size="13" font-weight="700" fill="#16a34a">2.2 MB</text>
+
+  <!-- sqlite3 (:memory:) — 2.9 MB -->
+  <text x="150" y="166" font-size="13" fill="#334155" text-anchor="end">sqlite3 (:memory:)</text>
+  <rect x="160" y="144" width="59" height="34" rx="4" fill="#94a3b8"/>
+  <text x="229" y="166" font-size="13" fill="#475569">2.9 MB</text>
+
+  <!-- pandas — 11.0 MB -->
+  <text x="150" y="218" font-size="13" fill="#334155" text-anchor="end">pandas</text>
+  <rect x="160" y="196" width="225" height="34" rx="4" fill="#94a3b8"/>
+  <text x="395" y="218" font-size="13" fill="#475569">11.0 MB</text>
+
+  <!-- dict (baseline) — 22.5 MB -->
+  <text x="150" y="270" font-size="13" fill="#334155" text-anchor="end">dict (baseline)</text>
+  <rect x="160" y="248" width="460" height="34" rx="4" fill="#94a3b8"/>
+  <text x="630" y="270" font-size="13" fill="#475569">22.5 MB</text>
+</svg>

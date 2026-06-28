@@ -15,6 +15,20 @@ precompiled struct codecs — built for **maximum speed at minimum memory**.
 pip install snapdb
 ```
 
+## Contents
+
+- [Key Innovations](#key-innovations)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Storage Modes](#storage-modes)
+- [Dictionary Encoding](#dictionary-encoding-v040) · [Delta Encoding](#delta-encoding-v050)
+- [Vectorized Filtering](#vectorized-filtering-v060) · [Auto-Indexing](#auto-indexing-v060) · [NumPy / Zero-Copy Export](#numpy--zero-copy-export-v060)
+- [Benchmarks](#benchmarks)
+- [Architecture](#architecture) · [Supported Types](#supported-types)
+- [Development](#development)
+- [Roadmap & Known Limitations](#roadmap--known-limitations)
+- [License](#license)
+
 ## Key Innovations
 
 - **Columnar engine** — ClickHouse-inspired per-column `array.array` storage; full-scan aggregation **~3× faster than SQLite** at a fraction of the memory
@@ -203,6 +217,15 @@ Plain numeric columns export a true zero-copy view; encoded columns
 (dictionary/delta) transparently fall back to a materialized copy.
 
 ## Benchmarks
+
+SnapDB's headline strength is memory efficiency — the columnar store is the
+lightest engine in this comparison while staying fully analytical:
+
+<p align="center">
+  <img src="docs/memory-efficiency.svg" alt="Memory footprint for 100,000 rows: SnapDB columnar 2.2 MB, sqlite3 in-memory 2.9 MB, pandas 11.0 MB, dict baseline 22.5 MB — lower is better" width="720">
+</p>
+
+<p align="center"><em>~5× lighter than pandas and ~10× lighter than a plain <code>dict</code> — with zero dependencies.</em></p>
 
 Reproduce locally (numbers below are from the environment noted in the table):
 
