@@ -154,6 +154,27 @@ class TestNumpyFilterParity(unittest.TestCase):
                                 limit=15, offset=7, use_numpy=False)
         self.assertEqual(a, b)
 
+    def test_limit_zero_parity(self):
+        # limit<=0 must return [] from both paths (was a pure-Python off-by-one)
+        for un in (True, False):
+            self.assertEqual(self.t.select_where([("age", ">", 0)], limit=0, use_numpy=un), [])
+            self.assertEqual(self.t.select_where([], limit=0, use_numpy=un), [])
+
+    def test_f32_precision_parity(self):
+        # f32 column: literal not exactly representable in float32 must match the
+        # pure-Python (float64-widened) comparison in both paths.
+        t = ColumnarTable("f", [("id", "i32"), ("v", "f32")])
+        t.batch_insert([{"id": 0, "v": 0.1}, {"id": 1, "v": 0.5}, {"id": 2, "v": 2.2}])
+        for cond in (("v", "==", 0.1), ("v", ">", 2.2), ("v", ">=", 0.5),
+                     ("v", "<", 0.5), ("v", "between", (0.1, 1.0)), ("v", "in", [0.5, 2.2])):
+            self.assertEqual(
+                t.count_where([cond], use_numpy=True),
+                t.count_where([cond], use_numpy=False), cond)
+            self.assertEqual(
+                sorted(r["id"] for r in t.select_where([cond], columns=["id"], use_numpy=True)),
+                sorted(r["id"] for r in t.select_where([cond], columns=["id"], use_numpy=False)),
+                cond)
+
     def test_count_where_parity(self):
         for conds, comb in self.queries:
             a = self.t.count_where(conds, combine=comb, use_numpy=True)

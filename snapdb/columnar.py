@@ -1048,6 +1048,11 @@ class ColumnarTable:
         byte mask (converted)."""
         if col._is_plain_numeric():
             arr = np.frombuffer(col.buffer(), dtype=_NUMPY_DTYPE[col._data.typecode])
+            # f32 columns: compare at float64 like the pure-Python path (which
+            # widens stored float32 to float), so a literal such as 0.1 matches
+            # identically instead of at float32 precision.
+            if col._data.typecode == "f":
+                arr = arr.astype(np.float64)
             valid = np.frombuffer(col._nullmask, dtype=np.int8) == 0
             if op in ("eq", "=="):
                 m = arr == value
@@ -1116,6 +1121,8 @@ class ColumnarTable:
         """
         if combine not in ("and", "or"):
             raise ValueError(f"combine must be 'and' or 'or', got {combine!r}")
+        if limit is not None and limit <= 0:
+            return []
         norm = self._normalize_conditions(conditions)
         n = self._row_count
         if n == 0:
