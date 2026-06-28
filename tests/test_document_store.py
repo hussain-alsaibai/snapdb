@@ -3,7 +3,7 @@
 import os
 import tempfile
 
-from document_store import DocumentStore
+from snapdb.document_store import DocumentStore
 
 
 def test_basic_insert_get():

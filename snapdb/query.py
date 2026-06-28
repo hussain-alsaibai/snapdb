@@ -7,7 +7,7 @@ import operator
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
-from snapdb import SnapDB
+from .core import SnapDB
 
 
 # ── Operators ──────────────────────────────────────────────────────────────────

@@ -27,22 +27,22 @@ from contextlib import contextmanager
 
 # v0.2.0 imports (optional)
 try:
-    from index import HashIndex, MultiIndex
+    from .index import HashIndex, MultiIndex
 except ImportError:
     HashIndex = None  # type: ignore
     MultiIndex = None  # type: ignore
 try:
-    from wal import WAL
+    from .wal import WAL
 except ImportError:
     WAL = None  # type: ignore
 
 # v0.3.0 imports (optional)
 try:
-    from columnar import ColumnarTable
+    from .columnar import ColumnarTable
 except ImportError:
     ColumnarTable = None  # type: ignore
 try:
-    from metrics import Metrics
+    from .metrics import Metrics
 except ImportError:
     Metrics = None  # type: ignore
 
