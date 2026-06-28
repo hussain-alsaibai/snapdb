@@ -537,8 +537,10 @@ class Column:
         if zero_copy and self._is_plain_numeric():
             return np.frombuffer(self.buffer(), dtype=_NUMPY_DTYPE[self._data.typecode])
         if self._is_plain_numeric() and self._nullmask.count(1) == 0:
-            return np.asarray(self._data, dtype=_NUMPY_DTYPE[self._data.typecode])
-        return np.asarray(self.tolist(), dtype=object)
+            # np.array (not np.asarray) forces a real copy so the result does
+            # not alias the column or lock its array against further inserts.
+            return np.array(self._data, dtype=_NUMPY_DTYPE[self._data.typecode])
+        return np.array(self.tolist(), dtype=object)
 
     def null_mask(self) -> List[bool]:
         """Return the validity bitmap as a list of bools (True == null)."""
