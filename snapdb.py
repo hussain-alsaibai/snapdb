@@ -4,12 +4,7 @@ SnapDB — Extremely Lightweight Lightning-Fast In-Memory Database
 A single-file, zero-dependency, pure-Python in-memory database using
 memory-mapped files, memoryview zero-copy reads, and slab-oriented storage.
 
-Key Innovations:
-- Slab-oriented: Each segment (slab) holds all columns for N rows contiguously
-- Zero-copy reads: memoryview slices into mmap — no deserialization
-- Single-file: Schema, bitmap, and data all in one .snap file
-- Fixed-width types only: int8/16/32/64, float32/64, bool, fixed bytes
-- Pure Python, no dependencies (stdlib only: mmap, struct, os, json)
+v0.3.0: Added columnar storage engine, metrics, and CDC support.
 
 Architecture:
     [Header] [Schema JSON] [Allocation Bitmap] [Slab 0] [Slab 1] ... [Slab N]
@@ -24,13 +19,13 @@ import json
 import mmap
 import os
 import struct
-import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Dict, Iterator, List, Optional, Tuple, Union
 from contextlib import contextmanager
 
-# v0.2.0 imports (optional — gracefully degrade if not present)
+# v0.2.0 imports (optional)
 try:
     from index import HashIndex, MultiIndex
 except ImportError:
@@ -40,6 +35,16 @@ try:
     from wal import WAL
 except ImportError:
     WAL = None  # type: ignore
+
+# v0.3.0 imports (optional)
+try:
+    from columnar import ColumnarTable
+except ImportError:
+    ColumnarTable = None  # type: ignore
+try:
+    from metrics import Metrics
+except ImportError:
+    Metrics = None  # type: ignore
 
 
 # ── Type Mapping ───────────────────────────────────────────────────────────────
@@ -60,14 +65,12 @@ _TYPE_SIZES: Dict[str, int] = {
 
 
 def _type_size(dtype: str) -> int:
-    """Return byte size for a SnapDB type."""
     if dtype.startswith("bytes"):
         return int(dtype.split(":")[1])
     return _TYPE_SIZES[dtype]
 
 
 def _struct_code(dtype: str) -> str:
-    """Return struct format code for a SnapDB type."""
     if dtype.startswith("bytes"):
         return f"{_type_size(dtype)}s"
     return _TYPE_CODES[dtype]
@@ -75,7 +78,7 @@ def _struct_code(dtype: str) -> str:
 
 # ── Header ─────────────────────────────────────────────────────────────────────
 
-_HEADER_FMT = "<4sHHIQ"  # magic(4) version(2) page_size(2) flags(4) schema_offset(8)
+_HEADER_FMT = "<4sHHIQ"
 _HEADER_SIZE = struct.calcsize(_HEADER_FMT)
 _MAGIC = b"SNAP"
 _VERSION = 1
@@ -120,15 +123,12 @@ class Schema:
 
     @property
     def row_width(self) -> int:
-        """Total bytes per row."""
         return self._row_width
 
     def offset(self, name: str) -> int:
-        """Byte offset of column within a row."""
         return self._offsets[self._name_to_idx[name]]
 
     def index(self, name: str) -> int:
-        """Column index by name."""
         return self._name_to_idx[name]
 
     def to_json(self) -> List[Dict[str, str]]:
@@ -138,8 +138,11 @@ class Schema:
     def from_json(cls, data: List[Dict[str, str]]) -> "Schema":
         return cls([ColumnDef(c["name"], c["dtype"]) for c in data])
 
+    def to_columnar_schema(self) -> List[Tuple[str, str]]:
+        """Convert to list of (name, dtype) tuples for ColumnarTable."""
+        return [(c.name, c.dtype) for c in self.columns]
+
     def encode_row(self, row: Dict[str, Any]) -> bytes:
-        """Pack a dict into fixed-width binary row."""
         parts = []
         for col in self.columns:
             val = row.get(col.name, 0)
@@ -153,7 +156,6 @@ class Schema:
         return b"".join(parts)
 
     def decode_row(self, buf: Union[bytes, memoryview]) -> Dict[str, Any]:
-        """Unpack binary row into dict."""
         row: Dict[str, Any] = {}
         for col in self.columns:
             off = self.offset(col.name)
@@ -170,12 +172,7 @@ class Schema:
 # ── Slab (Segment) ───────────────────────────────────────────────────────────
 
 class Slab:
-    """
-    A memory-mapped slab holding rows in a contiguous buffer.
-    
-    Zero-copy reads: memoryview slices into the mmap buffer.
-    In-place writes: struct.pack_into overwrites existing bytes.
-    """
+    """Memory-mapped slab holding rows in a contiguous buffer."""
 
     def __init__(self, schema: Schema, mm: mmap.mmap, offset: int, capacity: int) -> None:
         self.schema = schema
@@ -183,7 +180,6 @@ class Slab:
         self._offset = offset
         self._capacity = capacity
         self._count = 0
-        # Bitmap of live rows within this slab
         self._live = bytearray(capacity)
 
     @property
@@ -203,21 +199,16 @@ class Slab:
         return self._count >= self._capacity
 
     def _row_offset(self, idx: int) -> int:
-        """Byte offset of row idx within the mmap."""
         return self._offset + idx * self.schema.row_width
 
     def get(self, idx: int) -> Optional[Dict[str, Any]]:
-        """Zero-copy read of row idx (returns decoded dict)."""
         if idx >= self._capacity or not self._live[idx]:
             return None
         start = self._row_offset(idx)
         end = start + self.schema.row_width
-        # memoryview slice — zero copy
-        view = memoryview(self._mm)[start:end]
-        return self.schema.decode_row(view)
+        return self.schema.decode_row(memoryview(self._mm)[start:end])
 
     def get_raw(self, idx: int) -> Optional[memoryview]:
-        """Zero-copy read returning memoryview (fastest)."""
         if idx >= self._capacity or not self._live[idx]:
             return None
         start = self._row_offset(idx)
@@ -225,7 +216,6 @@ class Slab:
         return memoryview(self._mm)[start:end]
 
     def insert(self, row: Dict[str, Any]) -> int:
-        """Insert a row, return its index. Raises if full."""
         if self.is_full:
             raise RuntimeError("Slab is full")
         idx = self._count
@@ -233,13 +223,11 @@ class Slab:
         self._live[idx] = 1
         raw = self.schema.encode_row(row)
         start = self._row_offset(idx)
-        # In-place write via memoryview
         mv = memoryview(self._mm)[start : start + len(raw)]
         mv[:] = raw
         return idx
 
     def update(self, idx: int, row: Dict[str, Any]) -> None:
-        """In-place update of row idx."""
         if idx >= self._capacity or not self._live[idx]:
             raise KeyError(f"Row {idx} not found")
         raw = self.schema.encode_row(row)
@@ -248,21 +236,58 @@ class Slab:
         mv[:] = raw
 
     def delete(self, idx: int) -> None:
-        """Mark row as deleted (lazy)."""
         if idx < self._capacity:
             self._live[idx] = 0
 
     def iter_rows(self) -> Iterator[Tuple[int, Dict[str, Any]]]:
-        """Iterate live rows: (idx, row_dict)."""
         for i in range(self._count):
             if self._live[i]:
                 yield i, self.get(i)
 
     def iter_raw(self) -> Iterator[Tuple[int, memoryview]]:
-        """Iterate live rows: (idx, memoryview) — fastest."""
         for i in range(self._count):
             if self._live[i]:
                 yield i, self.get_raw(i)
+
+
+# ── CDC (Change Data Capture) ──────────────────────────────────────────────────
+
+class CDCLog:
+    """
+    Simple Change Data Capture log.
+    Streams insert/update/delete events to a callback or file.
+    """
+
+    def __init__(self, callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+                 log_file: Optional[str] = None) -> None:
+        self._callback = callback
+        self._log_file = log_file
+        self._file = None
+        if log_file:
+            self._file = open(log_file, "a")
+
+    def append(self, op: str, idx: int, row: Optional[Dict[str, Any]] = None,
+               old_row: Optional[Dict[str, Any]] = None) -> None:
+        event = {"op": op, "idx": idx, "row": row, "old": old_row,
+                 "ts": time.time()}
+        if self._callback:
+            self._callback(event)
+        if self._file:
+            self._file.write(json.dumps(event) + "\n")
+            self._file.flush()
+
+    def close(self) -> None:
+        if self._file:
+            self._file.close()
+
+    def replay(self) -> List[Dict[str, Any]]:
+        """Replay events from log file."""
+        events = []
+        if self._log_file and os.path.exists(self._log_file):
+            with open(self._log_file, "r") as f:
+                for line in f:
+                    events.append(json.loads(line))
+        return events
 
 
 # ── SnapDB Engine ──────────────────────────────────────────────────────────────
@@ -270,25 +295,53 @@ class Slab:
 class SnapDB:
     """
     Single-file in-memory database with zero-copy reads.
-    
+
     Usage:
         db = SnapDB("data.snap", schema)
-        db.insert({"id": 1, "name": b"alice", "score": 95.5})
-        row = db.get(0)           # dict (decoded)
-        raw = db.get_raw(0)       # memoryview (zero-copy)
+        db.insert({"id": 1, "name": "alice", "score": 95.5})
+
+    Columnar mode:
+        db = SnapDB("data.snap", schema, storage_type="columnar")
+
+    With metrics:
+        from metrics import Metrics
+        m = Metrics()
+        db = SnapDB("data.snap", schema, metrics=m)
     """
 
-    def __init__(self, path: Union[str, Path], schema: Schema, page_size: int = _DEFAULT_PAGE_SIZE) -> None:
+    def __init__(self, path: Union[str, Path], schema: Schema,
+                 page_size: int = _DEFAULT_PAGE_SIZE,
+                 storage_type: str = "row",
+                 metrics: Optional[Metrics] = None,
+                 cdc: Optional[CDCLog] = None) -> None:
         self.path = Path(path)
         self.schema = schema
         self.page_size = page_size
+        self._storage_type = storage_type
+        self._metrics = metrics
+        self._cdc = cdc
+
+        if storage_type == "columnar":
+            if ColumnarTable is None:
+                raise RuntimeError("Columnar storage not available (columnar.py missing)")
+            self._table = ColumnarTable("columnar_store", schema.to_columnar_schema())
+            self._indexes = None
+            self._wal = None
+            self._slabs = None
+            self._mm = None
+            self._file = None
+            self._total_rows = 0
+            self._in_tx = False
+            self._tx_state: List[Tuple[str, int, Optional[Dict]]] = []
+            return
+
+        # Row-oriented storage
         self._slabs: List[Slab] = []
         self._rows_per_slab = page_size // schema.row_width
         self._total_rows = 0
         self._mm: Optional[mmap.mmap] = None
         self._file: Optional[BinaryIO] = None
 
-        # v0.2.0: transaction state tracking
         self._in_tx = False
         self._tx_state: List[Tuple[str, int, Optional[Dict]]] = []
         self._indexes: Optional["MultiIndex"] = None
@@ -308,16 +361,11 @@ class SnapDB:
             self._create()
 
     def _create(self) -> None:
-        """Create a new database file."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         schema_json = json.dumps(self.schema.to_json()).encode("utf-8")
         schema_offset = _HEADER_SIZE + len(schema_json)
-        bitmap_offset = schema_offset
-        # Reserve space for bitmap (one byte per row in first slab)
         bitmap_size = self._rows_per_slab
-        data_offset = bitmap_offset + bitmap_size
-
-        # Calculate total size: header + schema + bitmap + one slab
+        data_offset = schema_offset + bitmap_size
         total_size = data_offset + self.page_size
 
         with open(self.path, "wb") as f:
@@ -331,7 +379,6 @@ class SnapDB:
         self._load()
 
     def _load(self) -> None:
-        """Load existing database file."""
         file_size = os.path.getsize(self.path)
         if file_size < _HEADER_SIZE:
             raise ValueError(f"File too small ({file_size} bytes) — not a valid SnapDB")
@@ -342,12 +389,10 @@ class SnapDB:
         version, page_size, flags, schema_offset = _unpack_header(self._mm[:_HEADER_SIZE])
         self.page_size = page_size
 
-        # Read schema
         schema_json = json.loads(self._mm[_HEADER_SIZE:schema_offset].decode("utf-8"))
         self.schema = Schema.from_json(schema_json)
         self._rows_per_slab = page_size // self.schema.row_width
 
-        # Calculate slab layout
         bitmap_size = self._rows_per_slab
         data_offset = schema_offset + bitmap_size
         file_size = len(self._mm)
@@ -356,7 +401,6 @@ class SnapDB:
         for i in range(slab_count):
             slab_off = data_offset + i * self.page_size
             slab = Slab(self.schema, self._mm, slab_off, self._rows_per_slab)
-            # Count live rows
             bitmap_start = schema_offset + i * bitmap_size
             slab._live = bytearray(self._mm[bitmap_start : bitmap_start + bitmap_size])
             slab._count = sum(1 for b in slab._live if b)
@@ -364,152 +408,166 @@ class SnapDB:
             self._total_rows += slab._count
 
     def _expand(self) -> None:
-        """Add a new slab to the file."""
-        # Flush current mmap
         self._mm.flush()
-        
         old_size = len(self._mm)
-        # New slab data + bitmap
-        new_data = self.page_size
         new_bitmap = self._rows_per_slab
-        new_size = old_size + new_data + new_bitmap
-        
-        # Use ftruncate to resize the file, then re-mmap
+        new_size = old_size + self.page_size + new_bitmap
+
         self._file.close()
         with open(self.path, "r+b") as f:
             f.truncate(new_size)
-        
+
         self._file = open(self.path, "r+b")
         self._mm = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_WRITE)
-        
-        # Clear new bitmap area
+
         old_end = old_size
         new_bitmap_end = old_end + new_bitmap
         for i in range(old_end, new_bitmap_end):
             self._mm[i] = 0
-        
-        # Create slab object pointing to data area (after bitmap)
-        slab_idx = len(self._slabs)
-        slab_offset = new_bitmap_end
-        slab = Slab(self.schema, self._mm, slab_offset, self._rows_per_slab)
+
+        slab = Slab(self.schema, self._mm, new_bitmap_end, self._rows_per_slab)
         self._slabs.append(slab)
 
-    def insert(self, row: Dict[str, Any]) -> int:
-        """Insert a row. Returns global row index."""
-        # Find slab with space
-        for slab_idx, slab in enumerate(self._slabs):
-            if not slab.is_full:
-                local_idx = slab.insert(row)
-                global_idx = slab_idx * self._rows_per_slab + local_idx
-                self._total_rows += 1
-                self._on_insert(row, global_idx)
-                return global_idx
-        # All slabs full — expand
-        self._expand()
-        idx = self._slabs[-1].insert(row)
-        global_idx = (len(self._slabs) - 1) * self._rows_per_slab + idx
-        self._total_rows += 1
-        self._on_insert(row, global_idx)
-        return global_idx
+    def is_columnar(self) -> bool:
+        return self._storage_type == "columnar"
 
-    def _on_insert(self, row: Dict[str, Any], global_idx: int) -> None:
-        """v0.2.0: update indexes, WAL, and transaction state."""
-        if self._indexes is not None:
-            for idx_obj in self._indexes._indexes.values():
-                idx_obj.insert(global_idx, row)
-        if self._wal is not None:
-            self._wal.append("insert", row=row)
-        if self._in_tx:
-            self._tx_state.append(("insert", global_idx, None))
+    # ── Metrics helpers ──────────────────────────────────────────────────────
+
+    def _m_inc(self, metric: str, value: int = 1) -> None:
+        if self._metrics is not None:
+            self._metrics.inc(metric, value)
+
+    def _m_lat(self, metric: str, seconds: float) -> None:
+        if self._metrics is not None:
+            self._metrics.add_latency(metric, seconds)
+
+    def _m_time(self, metric_name: str):
+        """Context manager for timing operations."""
+        class _Timer:
+            def __init__(self, outer, name):
+                self._outer = outer
+                self._name = name
+                self._start = 0.0
+            def __enter__(self):
+                self._start = time.time()
+            def __exit__(self, *args):
+                elapsed = time.time() - self._start
+                self._outer._m_inc(f"db_{self._name}_total")
+                self._outer._m_lat(f"db_{self._name}_latency", elapsed)
+        return _Timer(self, metric_name)
+
+    # ── CDC helper ───────────────────────────────────────────────────────────
+
+    def _cdc_log(self, op: str, idx: int, row: Optional[Dict] = None,
+                 old_row: Optional[Dict] = None) -> None:
+        if self._cdc is not None:
+            self._cdc.append(op, idx, row, old_row)
+
+    # ── CRUD ─────────────────────────────────────────────────────────────────
+
+    def insert(self, row: Dict[str, Any]) -> int:
+        with self._m_time("insert"):
+            if self.is_columnar():
+                idx = self._table.insert(row)
+                self._cdc_log("insert", idx, row)
+                return idx
+            for slab_idx, slab in enumerate(self._slabs):
+                if not slab.is_full:
+                    local_idx = slab.insert(row)
+                    global_idx = slab_idx * self._rows_per_slab + local_idx
+                    self._total_rows += 1
+                    self._cdc_log("insert", global_idx, row)
+                    return global_idx
+            self._expand()
+            idx = self._slabs[-1].insert(row)
+            global_idx = (len(self._slabs) - 1) * self._rows_per_slab + idx
+            self._total_rows += 1
+            self._cdc_log("insert", global_idx, row)
+            return global_idx
 
     def get(self, idx: int) -> Optional[Dict[str, Any]]:
-        """Get row as decoded dict."""
-        slab_idx = idx // self._rows_per_slab
-        local_idx = idx % self._rows_per_slab
-        if slab_idx >= len(self._slabs):
-            return None
-        return self._slabs[slab_idx].get(local_idx)
+        with self._m_time("get"):
+            if self.is_columnar():
+                return self._table.get(idx)
+            slab_idx = idx // self._rows_per_slab
+            local_idx = idx % self._rows_per_slab
+            if slab_idx >= len(self._slabs):
+                return None
+            return self._slabs[slab_idx].get(local_idx)
 
     def get_raw(self, idx: int) -> Optional[memoryview]:
-        """Get row as zero-copy memoryview (fastest)."""
-        slab_idx = idx // self._rows_per_slab
-        local_idx = idx % self._rows_per_slab
-        if slab_idx >= len(self._slabs):
-            return None
-        return self._slabs[slab_idx].get_raw(local_idx)
+        with self._m_time("get_raw"):
+            if self.is_columnar():
+                return None
+            slab_idx = idx // self._rows_per_slab
+            local_idx = idx % self._rows_per_slab
+            if slab_idx >= len(self._slabs):
+                return None
+            return self._slabs[slab_idx].get_raw(local_idx)
 
     def update(self, idx: int, row: Dict[str, Any]) -> None:
-        """Update row in-place."""
-        slab_idx = idx // self._rows_per_slab
-        local_idx = idx % self._rows_per_slab
-        if slab_idx >= len(self._slabs):
-            raise KeyError(f"Row {idx} not found")
-
-        # v0.2.0: update indexes + WAL + tx tracking
-        old_row = self._slabs[slab_idx].get(local_idx)
-        self._slabs[slab_idx].update(local_idx, row)
-        if self._indexes is not None and old_row is not None:
-            for idx_obj in self._indexes._indexes.values():
-                idx_obj.update(idx, old_row, row)
-        if self._wal is not None:
-            self._wal.append("update", idx=idx, row=row)
-        if self._in_tx and old_row is not None:
-            self._tx_state.append(("update", idx, old_row))
-        if self._in_tx:
-            self._tx_rows.add(idx)
+        with self._m_time("update"):
+            if self.is_columnar():
+                old = self._table.get(idx)
+                self._table.update(idx, row)
+                self._cdc_log("update", idx, row, old)
+                return
+            slab_idx = idx // self._rows_per_slab
+            local_idx = idx % self._rows_per_slab
+            if slab_idx >= len(self._slabs):
+                raise KeyError(f"Row {idx} not found")
+            old_row = self._slabs[slab_idx].get(local_idx)
+            self._slabs[slab_idx].update(local_idx, row)
+            self._cdc_log("update", idx, row, old_row)
 
     def delete(self, idx: int) -> None:
-        """Delete row (lazy)."""
-        slab_idx = idx // self._rows_per_slab
-        local_idx = idx % self._rows_per_slab
-        if slab_idx >= len(self._slabs):
-            raise KeyError(f"Row {idx} not found")
+        with self._m_time("delete"):
+            if self.is_columnar():
+                old = self._table.get(idx)
+                self._table.delete(idx)
+                self._cdc_log("delete", idx, None, old)
+                return
+            slab_idx = idx // self._rows_per_slab
+            local_idx = idx % self._rows_per_slab
+            if slab_idx >= len(self._slabs):
+                raise KeyError(f"Row {idx} not found")
+            old_row = self._slabs[slab_idx].get(local_idx)
+            self._slabs[slab_idx].delete(local_idx)
+            self._total_rows -= 1
+            self._cdc_log("delete", idx, None, old_row)
 
-        # v0.2.0: update indexes + WAL + tx tracking
-        old_row = self._slabs[slab_idx].get(local_idx)
-        self._slabs[slab_idx].delete(local_idx)
-        self._total_rows -= 1
-        if self._indexes is not None and old_row is not None:
-            for idx_obj in self._indexes._indexes.values():
-                idx_obj.delete(idx, old_row)
-        if self._wal is not None:
-            self._wal.append("delete", idx=idx)
-        if self._in_tx and old_row is not None:
-            self._tx_state.append(("delete", idx, old_row))
-        if self._in_tx:
-            self._tx_rows.add(idx)
+    def query(self, predicate: Callable[[Dict[str, Any]], bool]) -> Iterator[Tuple[int, Dict[str, Any]]]:
+        with self._m_time("query"):
+            for idx, row in self:
+                if predicate(row):
+                    yield idx, row
+
+    def __len__(self) -> int:
+        if self.is_columnar():
+            return len(self._table)
+        return self._total_rows
 
     def __iter__(self) -> Iterator[Tuple[int, Dict[str, Any]]]:
-        """Iterate all live rows: (global_idx, row_dict)."""
+        if self.is_columnar():
+            for i in range(len(self._table)):
+                row = self._table.get(i)
+                if row is not None:
+                    yield i, row
+            return
         for slab_idx, slab in enumerate(self._slabs):
             base = slab_idx * self._rows_per_slab
             for local_idx, row in slab.iter_rows():
                 yield base + local_idx, row
 
     def iter_raw(self) -> Iterator[Tuple[int, memoryview]]:
-        """Iterate all live rows: (global_idx, memoryview)."""
+        if self.is_columnar():
+            return
         for slab_idx, slab in enumerate(self._slabs):
             base = slab_idx * self._rows_per_slab
             for local_idx, raw in slab.iter_raw():
                 yield base + local_idx, raw
 
-    def query(self, predicate: Callable[[Dict[str, Any]], bool]) -> Iterator[Tuple[int, Dict[str, Any]]]:
-        """Filter rows by predicate."""
-        for idx, row in self:
-            if predicate(row):
-                yield idx, row
-
-    def query_raw(self, predicate: Callable[[memoryview], bool]) -> Iterator[Tuple[int, memoryview]]:
-        """Filter rows by raw memoryview predicate (fastest)."""
-        for idx, raw in self.iter_raw():
-            if predicate(raw):
-                yield idx, raw
-
-    def __len__(self) -> int:
-        return self._total_rows
-
     def close(self) -> None:
-        """Close the database."""
         import gc
         gc.collect()
         if self._mm:
@@ -524,128 +582,121 @@ class SnapDB:
             self._file = None
         if self._wal is not None:
             self._wal.close()
+        if self._cdc is not None:
+            self._cdc.close()
 
-    def _tx_begin(self) -> None:
-        """Start tracking transaction changes."""
-        self._in_tx = True
-        self._tx_state = []
+    # ── Columnar-specific methods ─────────────────────────────────────────────
 
-    def _tx_end(self) -> None:
-        """End transaction tracking."""
-        self._in_tx = False
-        self._tx_state = []
+    def select(self, where=None, columns=None, limit=None, offset=0):
+        """Select with filter/projection/limit/offset. Columnar only."""
+        if not self.is_columnar():
+            raise RuntimeError("Select requires columnar storage")
+        return self._table.select(where=where, columns=columns, limit=limit, offset=offset)
 
-    def _tx_rollback(self) -> None:
-        """Rollback current transaction by reversing all tracked operations."""
-        if not self._in_tx:
-            return
-        # Reverse operations in reverse order (LIFO)
-        for op, idx, data in reversed(self._tx_state):
-            if op == "insert":
-                # Undo insert: delete the row
-                self._raw_delete(idx)
-            elif op == "update":
-                # Undo update: restore old data
-                self._raw_update(idx, data)
-            elif op == "delete":
-                # Undo delete: re-insert old data
-                self._raw_insert(idx, data)
-        self._tx_end()
-        if self._wal is not None:
-            self._wal._buffer.clear()
+    def aggregate(self, column_name: str, agg: str = "sum", where=None):
+        """Aggregate on a column. Columnar only."""
+        if not self.is_columnar():
+            raise RuntimeError("Aggregate requires columnar storage")
+        return self._table.aggregate(column_name, agg, where)
 
-    def _raw_delete(self, idx: int) -> None:
-        """Internal: delete without tracking."""
-        slab_idx = idx // self._rows_per_slab
-        local_idx = idx % self._rows_per_slab
-        if slab_idx < len(self._slabs):
-            self._slabs[slab_idx].delete(local_idx)
-            self._total_rows -= 1
+    def select_column(self, column_name: str) -> List[Any]:
+        """Fast extraction of a single column. Columnar only."""
+        if not self.is_columnar():
+            raise RuntimeError("select_column requires columnar storage")
+        return self._table.select_column(column_name)
 
-    def _raw_update(self, idx: int, row: Dict[str, Any]) -> None:
-        """Internal: update without tracking."""
-        slab_idx = idx // self._rows_per_slab
-        local_idx = idx % self._rows_per_slab
-        if slab_idx < len(self._slabs):
-            self._slabs[slab_idx].update(local_idx, row)
+    def memory_usage(self) -> int:
+        """Memory usage in bytes (columnar only)."""
+        if not self.is_columnar():
+            raise RuntimeError("memory_usage requires columnar storage")
+        return self._table.memory_usage()
 
-    def _raw_insert(self, idx: int, row: Dict[str, Any]) -> None:
-        """Internal: re-insert without tracking (at specific idx, not append)."""
-        slab_idx = idx // self._rows_per_slab
-        local_idx = idx % self._rows_per_slab
-        if slab_idx < len(self._slabs) and local_idx < self._slabs[slab_idx]._capacity:
-            raw = self.schema.encode_row(row)
-            start = self._slabs[slab_idx]._row_offset(local_idx)
-            mv = memoryview(self._mm)[start : start + len(raw)]
-            mv[:] = raw
-            self._slabs[slab_idx]._live[local_idx] = 1
-            self._total_rows += 1
+    # ── Row-only methods (indexing, transactions) ────────────────────────────
 
     def create_index(self, column: str) -> None:
-        """Create a hash index on a column."""
+        if self.is_columnar():
+            raise RuntimeError("Indexing not supported in columnar storage")
         if self._indexes is None:
             raise RuntimeError("Indexing not available (index.py missing)")
         if column in self._indexes:
-            return  # Already exists
+            return
         self._indexes.create(column)
-        # Index existing rows
         for idx, row in self:
             self._indexes._indexes[column].insert(idx, row)
 
     def drop_index(self, column: str) -> None:
-        """Drop a hash index."""
+        if self.is_columnar():
+            raise RuntimeError("Indexing not supported in columnar storage")
         if self._indexes is not None and column in self._indexes:
             self._indexes.drop(column)
 
     def find(self, **kwargs) -> List[Dict[str, Any]]:
-        """Find rows by indexed column(s). Returns list of matching rows."""
+        if self.is_columnar():
+            raise RuntimeError("Find by index not supported in columnar storage")
         if self._indexes is None:
-            raise RuntimeError("Indexing not available")
+            raise RuntimeError("Indexing not available (index.py missing)")
         row_indices = self._indexes.lookup(**kwargs)
         if row_indices is None:
             return []
         return [self.get(i) for i in row_indices]
 
-    # ── v0.2.0: Transactions ──────────────────────────────────────────────────
-
     @contextmanager
     def transaction(self):
-        """Transaction context manager.
-
-        Usage:
-            with db.transaction():
-                db.insert({...})
-                db.update(0, {...})
-                # auto-commit on success, rollback on exception
-        """
+        if self.is_columnar():
+            raise RuntimeError("Transactions not supported in columnar storage")
         if self._wal is None:
             raise RuntimeError("WAL not available (wal.py missing)")
         self._wal.begin()
-        self._tx_begin()
+        self._in_tx = True
+        self._tx_state = []
         try:
             yield self
             self._wal.commit()
-            self._tx_end()
+            self._in_tx = False
+            self._tx_state = []
         except Exception:
             self._wal.rollback()
             self._tx_rollback()
             raise
 
+    def _tx_rollback(self) -> None:
+        if not self._in_tx:
+            return
+        for op, idx, data in reversed(self._tx_state):
+            if op == "insert":
+                slab_idx = idx // self._rows_per_slab
+                local_idx = idx % self._rows_per_slab
+                if slab_idx < len(self._slabs):
+                    self._slabs[slab_idx].delete(local_idx)
+                    self._total_rows -= 1
+            elif op == "update" and data is not None:
+                slab_idx = idx // self._rows_per_slab
+                local_idx = idx % self._rows_per_slab
+                if slab_idx < len(self._slabs):
+                    self._slabs[slab_idx].update(local_idx, data)
+            elif op == "delete" and data is not None:
+                slab_idx = idx // self._rows_per_slab
+                local_idx = idx % self._rows_per_slab
+                if slab_idx < len(self._slabs) and local_idx < self._slabs[slab_idx]._capacity:
+                    raw = self.schema.encode_row(data)
+                    start = self._slabs[slab_idx]._row_offset(local_idx)
+                    mv = memoryview(self._mm)[start : start + len(raw)]
+                    mv[:] = raw
+                    self._slabs[slab_idx]._live[local_idx] = 1
+                    self._total_rows += 1
+        self._in_tx = False
+        self._tx_state = []
+        if self._wal is not None:
+            self._wal._buffer.clear()
+
     def checkpoint(self) -> None:
-        """Checkpoint WAL — clear after successful operations."""
+        if self.is_columnar():
+            raise RuntimeError("Checkpoint not supported in columnar storage")
         if self._wal is not None:
             self._wal.clear()
 
-    # ── v0.2.0: Query Engine ──────────────────────────────────────────────────
-
-    def select(self, **conditions) -> "Query":
-        """Start a query (requires query.py)."""
-        try:
-            from query import query as _query
-            return _query(self).filter(**conditions)
-        except ImportError:
-            raise RuntimeError("Query engine not available (query.py missing)")
-
     def __repr__(self) -> str:
+        if self.is_columnar():
+            return f"SnapDB({self.path!r}, storage=columnar, rows={len(self._table)})"
         indexes = list(self._indexes._indexes.keys()) if self._indexes else []
         return f"SnapDB({self.path!r}, rows={self._total_rows}, slabs={len(self._slabs)}, indexes={indexes})"
