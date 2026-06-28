@@ -11,7 +11,18 @@ v0.5.0: Delta encoding for monotonic numeric columns.
 from __future__ import annotations
 
 import array
+import operator
 from typing import Any, Dict, List, Tuple, Callable, Iterator, Optional
+
+# Comparison operators for vectorized predicates (issue #4)
+_FILTER_OPS = {
+    "eq": operator.eq, "==": operator.eq,
+    "ne": operator.ne, "!=": operator.ne,
+    "gt": operator.gt, ">": operator.gt,
+    "gte": operator.ge, ">=": operator.ge,
+    "lt": operator.lt, "<": operator.lt,
+    "lte": operator.le, "<=": operator.le,
+}
 
 _TYPE_CODES = {
     "i8": "b", "i16": "h", "i32": "i", "i64": "q",
@@ -29,6 +40,16 @@ _TYPE_SIZES = {
 
 # Numeric types eligible for delta encoding
 _DELTA_ELIGIBLE = {"i32", "i64", "u32", "u64"}
+
+# Integer types eligible for Frame-of-Reference (FOR) encoding
+_FOR_ELIGIBLE = {"i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"}
+
+# array.array typecode -> NumPy dtype string, for zero-copy export (PEP 688 / #7)
+_NUMPY_DTYPE = {
+    "b": "int8", "B": "uint8", "h": "int16", "H": "uint16",
+    "i": "int32", "I": "uint32", "q": "int64", "Q": "uint64",
+    "f": "float32", "d": "float64",
+}
 
 
 def _type_size(dtype: str) -> int:
@@ -76,7 +97,18 @@ class Column:
 
     v0.4.0: Dictionary encoding for low-cardinality string columns.
     v0.5.0: Delta encoding for monotonic numeric columns.
+    v0.6.0: O(1) delta reads via a lazily-built reconstruction cache;
+            __slots__ for lower per-column memory overhead.
     """
+
+    __slots__ = (
+        "name", "dtype", "width",
+        "_dict_encode", "_dict_threshold", "_dict_mode", "_dict_fallback",
+        "_dict", "_dict_values", "_dict_codes",
+        "_delta_encode", "_delta_samples", "_delta_mode", "_delta_fallback",
+        "_delta_base", "_delta_prev", "_deltas", "_delta_typecode", "_delta_cache",
+        "_data", "_nullmask",
+    )
 
     def __init__(self, name: str, dtype: str,
                  dict_encode: bool = False, dict_threshold: int = 256,
@@ -101,6 +133,10 @@ class Column:
         self._delta_prev: int = 0              # previous value for delta computation
         self._deltas: Optional[array.array] = None  # delta per row
         self._delta_typecode: Optional[str] = None
+        # Lazily-built full reconstruction of a delta column. Built on first
+        # read after a write so random access / scans are O(1) / O(n) instead
+        # of O(n) / O(n^2). Invalidated (set to None) whenever deltas change.
+        self._delta_cache: Optional[array.array] = None
         self._data: Any = None
         self._nullmask: Optional[array.array] = None
         self._init_storage()
@@ -147,21 +183,34 @@ class Column:
         self._dict_values = []
         self._dict_codes = None
 
+    def _reconstruct_delta(self) -> array.array:
+        """Rebuild the full value array from base + deltas (O(n), one pass)."""
+        out = array.array(_array_typecode(self.dtype))
+        val = self._delta_base
+        out.append(val)  # row 0 == base
+        for d in self._deltas:
+            val += d
+            out.append(val)
+        return out
+
+    def _ensure_delta_cache(self) -> array.array:
+        """Return a cached full reconstruction, building it once if needed."""
+        cache = self._delta_cache
+        if cache is None:
+            cache = self._reconstruct_delta()
+            self._delta_cache = cache
+        return cache
+
     def _convert_delta_to_raw(self) -> None:
         """Convert from delta mode back to raw storage (non-monotonic detected)."""
         if not self._delta_mode or self._delta_fallback:
             return
         self._delta_fallback = True
         # Reconstruct full values from base + deltas
-        raw = array.array(_array_typecode(self.dtype))
-        val = self._delta_base
-        raw.append(val)
-        for i in range(1, len(self._deltas)):
-            val += self._deltas[i]
-            raw.append(val)
-        self._data = raw
+        self._data = self._reconstruct_delta()
         self._delta_mode = False
         self._deltas = None
+        self._delta_cache = None
         self._delta_base = 0
         self._delta_prev = 0
         self._delta_typecode = None
@@ -225,6 +274,7 @@ class Column:
 
     def _append_delta(self, value: int) -> None:
         """Append value using delta encoding."""
+        self._delta_cache = None  # invalidate reconstruction cache
         delta = value - self._delta_prev
         self._delta_prev = value
 
@@ -263,6 +313,7 @@ class Column:
                 pass
             elif self._delta_mode and not self._delta_fallback:
                 self._deltas.append(0)
+                self._delta_cache = None  # invalidate reconstruction cache
             else:
                 self._data.append(0 if self._data.typecode not in ("f", "d") else 0.0)
         else:
@@ -309,6 +360,7 @@ class Column:
                                 self._deltas.append(delta)
                                 prev = old_data[i]
                             self._delta_prev = prev
+                            self._delta_cache = None  # invalidate reconstruction cache
                         else:
                             self._delta_fallback = True
                 else:
@@ -318,13 +370,12 @@ class Column:
                 self._data.append(value)
 
     def _get_delta_value(self, idx: int) -> int:
-        """Reconstruct value from delta encoding at index."""
-        if idx == 0:
-            return self._delta_base
-        val = self._delta_base
-        for i in range(idx):
-            val += self._deltas[i]
-        return val
+        """Reconstruct value from delta encoding at index (O(1) amortized).
+
+        Uses a cached full reconstruction so repeated point/scan access does
+        not re-sum the delta prefix on every call (previously O(n) per read).
+        """
+        return self._ensure_delta_cache()[idx]
 
     def __getitem__(self, idx: int) -> Any:
         if self._nullmask[idx]:
@@ -354,7 +405,9 @@ class Column:
                 # Clear the bit
                 self._data &= ~(1 << idx)
             elif self._delta_mode and not self._delta_fallback:
-                self._deltas[idx] = 0
+                # Delta values are cumulative — zeroing a delta would shift every
+                # later row. Leave the chain intact; the nullmask hides this row.
+                pass
             else:
                 self._data[idx] = 0.0 if self._data.typecode in ("f", "d") else 0
         else:
@@ -395,6 +448,9 @@ class Column:
         is_bool = self.dtype == "bool"
         is_dict = self._dict_mode and not self._dict_fallback
         is_delta = self._delta_mode and not self._delta_fallback
+        if is_delta:
+            # Reconstruct once (O(n)); previously this re-summed per element (O(n^2)).
+            data = self._ensure_delta_cache()
         for i in range(len(nullmask)):
             if nullmask[i] == 0:
                 if is_dict:
@@ -403,13 +459,92 @@ class Column:
                     yield i, data[i].decode("utf-8", errors="replace")
                 elif is_bool:
                     yield i, bool((data >> i) & 1)
-                elif is_delta:
-                    yield i, self._get_delta_value(i)
                 else:
                     yield i, data[i]
 
+    def tolist(self) -> List[Any]:
+        """Materialize the whole column to a Python list (None for nulls).
+
+        Single O(n) pass that avoids per-element __getitem__ dispatch — used by
+        column scans (select / select_column) for a large constant-factor win.
+        """
+        nullmask = self._nullmask
+        n = len(nullmask)
+        if self.dtype == "bool":
+            data = self._data
+            return [None if nullmask[i] else bool((data >> i) & 1) for i in range(n)]
+        if self.dtype.startswith("bytes"):
+            if self._dict_mode and not self._dict_fallback:
+                values, codes = self._dict_values, self._dict_codes
+                return [None if nullmask[i]
+                        else values[codes[i]].decode("utf-8", errors="replace")
+                        for i in range(n)]
+            data = self._data
+            return [None if nullmask[i]
+                    else data[i].decode("utf-8", errors="replace")
+                    for i in range(n)]
+        if self._delta_mode and not self._delta_fallback:
+            data = self._ensure_delta_cache()
+        else:
+            data = self._data
+        return [None if nullmask[i] else data[i] for i in range(n)]
+
     def count_valid(self) -> int:
         return self._nullmask.count(0)
+
+    # ── Zero-copy / NumPy interop (issue #7) ─────────────────────────────────
+
+    def _is_plain_numeric(self) -> bool:
+        """True when values live in a contiguous array.array (no encoding)."""
+        return (
+            not self.dtype.startswith("bytes")
+            and self.dtype != "bool"
+            and not (self._dict_mode and not self._dict_fallback)
+            and not (self._delta_mode and not self._delta_fallback)
+        )
+
+    def buffer(self) -> memoryview:
+        """Zero-copy ``memoryview`` over the raw numeric buffer.
+
+        Only available for plain (un-encoded) numeric columns. While the
+        returned view is alive the column cannot grow — the underlying
+        ``array.array`` is locked against resizing by the buffer export — so
+        release the view before further inserts. Null entries are not masked;
+        pair with :meth:`null_mask`.
+        """
+        if not self._is_plain_numeric():
+            raise TypeError(
+                f"zero-copy buffer unavailable for column {self.name!r} "
+                f"(dtype={self.dtype}; encoded or non-numeric) — use to_numpy()"
+            )
+        return memoryview(self._data)
+
+    def __buffer__(self, flags):  # PEP 688 (Python 3.12+)
+        return self.buffer()
+
+    def to_numpy(self, zero_copy: bool = False):
+        """Export the column as a NumPy array (requires ``numpy``).
+
+        ``zero_copy=True`` returns a view that shares memory with the column
+        (plain numeric columns only; see :meth:`buffer` for the lifetime
+        caveat). The default returns a safe copy that also works for encoded
+        columns; null entries come back as the column's zero value unless the
+        column contains nulls, in which case an ``object`` array with ``None``
+        is returned. Use :meth:`null_mask` for validity.
+        """
+        import numpy as np  # optional dependency, imported lazily
+
+        if zero_copy and self._is_plain_numeric():
+            return np.frombuffer(self.buffer(), dtype=_NUMPY_DTYPE[self._data.typecode])
+        if self._is_plain_numeric() and self._nullmask.count(1) == 0:
+            # np.array (not np.asarray) forces a real copy so the result does
+            # not alias the column or lock its array against further inserts.
+            return np.array(self._data, dtype=_NUMPY_DTYPE[self._data.typecode])
+        return np.array(self.tolist(), dtype=object)
+
+    def null_mask(self) -> List[bool]:
+        """Return the validity bitmap as a list of bools (True == null)."""
+        return [bool(x) for x in self._nullmask]
 
     def memory_usage(self) -> int:
         if self.dtype.startswith("bytes"):
@@ -537,7 +672,9 @@ class ColumnarTable:
                 else:
                     col._data[idx] = b""
             elif col._delta_mode and not col._delta_fallback:
-                col._deltas[idx] = 0
+                # Delta values are cumulative — mutating a delta would corrupt
+                # every later row. The nullmask alone marks the row deleted.
+                pass
             elif hasattr(col._data, 'typecode') and col._data.typecode in ("f", "d"):
                 col._data[idx] = 0.0
             else:
@@ -559,18 +696,25 @@ class ColumnarTable:
         result: List[Dict[str, Any]] = []
         matched = 0
 
-        # Pre-fetch column references for speed
-        selected_cols = [self.columns[name] for name in col_names]
         all_cols = self._col_list
+        first_nullmask = all_cols[0]._nullmask
+
+        # Materialize the needed columns up front. This avoids per-cell
+        # __getitem__ dispatch and, crucially, keeps delta columns O(n) instead
+        # of O(n^2). When a predicate is present it sees every column, so all
+        # columns are materialized; otherwise only the projected ones are.
+        if where is not None:
+            mat = {col.name: col.tolist() for col in all_cols}
+        else:
+            mat = {name: self.columns[name].tolist() for name in col_names}
 
         for idx in range(self._row_count):
             # Quick null check: skip if first col is null (likely deleted)
-            if all_cols[0]._nullmask[idx]:
+            if first_nullmask[idx]:
                 continue
 
             if where is not None:
-                # Build row dict for predicate
-                row = {col.name: col[idx] for col in all_cols}
+                row = {name: mat[name][idx] for name in self._col_names}
                 if not where(row):
                     continue
 
@@ -578,8 +722,7 @@ class ColumnarTable:
                 matched += 1
                 continue
 
-            # Build projected row
-            result.append({name: col[idx] for name, col in zip(col_names, selected_cols)})
+            result.append({name: mat[name][idx] for name in col_names})
             matched += 1
             if limit is not None and len(result) >= limit:
                 break
@@ -588,8 +731,157 @@ class ColumnarTable:
     def select_column(self, column_name: str) -> List[Any]:
         if column_name not in self.columns:
             raise ValueError(f"Unknown column: {column_name}")
-        col = self.columns[column_name]
-        return [col[i] for i in range(len(col))]
+        # tolist() is a single O(n) pass (and O(n) — not O(n^2) — for delta cols).
+        return self.columns[column_name].tolist()
+
+    def to_numpy(self, column_name: str, zero_copy: bool = False):
+        """Export a column as a NumPy array (requires ``numpy``). See
+        :meth:`Column.to_numpy`."""
+        if column_name not in self.columns:
+            raise ValueError(f"Unknown column: {column_name}")
+        return self.columns[column_name].to_numpy(zero_copy=zero_copy)
+
+    def column_buffer(self, column_name: str) -> memoryview:
+        """Zero-copy ``memoryview`` over a plain numeric column's raw buffer."""
+        if column_name not in self.columns:
+            raise ValueError(f"Unknown column: {column_name}")
+        return self.columns[column_name].buffer()
+
+    # ── Vectorized multi-condition filter (issue #4) ─────────────────────────
+
+    def _normalize_conditions(self, conditions) -> List[Tuple[str, str, Any]]:
+        """Accept either a list of ``(column, op, value)`` triples or a dict
+        ``{column: value}`` / ``{column: {op: value}}`` and return triples."""
+        norm: List[Tuple[str, str, Any]] = []
+        if isinstance(conditions, dict):
+            for col, spec in conditions.items():
+                if isinstance(spec, dict):
+                    for op, val in spec.items():
+                        norm.append((col, op, val))
+                else:
+                    norm.append((col, "eq", spec))
+        else:
+            for cond in conditions:
+                if len(cond) != 3:
+                    raise ValueError(f"condition must be (column, op, value): {cond!r}")
+                norm.append((cond[0], cond[1], cond[2]))
+        for col, op, _ in norm:
+            if col not in self.columns:
+                raise ValueError(f"Unknown column: {col}")
+            if op not in _FILTER_OPS and op not in ("in", "between"):
+                raise ValueError(f"Unsupported operator: {op!r}")
+        return norm
+
+    def _condition_mask(self, col_name: str, op: str, value: Any,
+                        materialized: Dict[str, List[Any]]) -> bytearray:
+        """Build a 1-byte-per-row match mask for a single condition."""
+        col = self.columns[col_name]
+        vals = materialized.get(col_name)
+        if vals is None:
+            vals = col.tolist()
+            materialized[col_name] = vals
+
+        # bytes columns materialize to decoded str — normalize comparison
+        # values (given as bytes or str) the same way so they compare equal.
+        if col.dtype.startswith("bytes"):
+            def _conv(x):
+                return x.decode("utf-8", errors="replace") if isinstance(x, bytes) else x
+        else:
+            def _conv(x):
+                return x
+
+        mask = bytearray(len(vals))
+        if op == "in":
+            members = {_conv(m) for m in value}
+            for i, v in enumerate(vals):
+                if v is not None and v in members:
+                    mask[i] = 1
+        elif op == "between":
+            lo, hi = _conv(value[0]), _conv(value[1])
+            for i, v in enumerate(vals):
+                if v is not None and lo <= v <= hi:
+                    mask[i] = 1
+        else:
+            target = _conv(value)
+            fn = _FILTER_OPS[op]
+            for i, v in enumerate(vals):
+                if v is not None and fn(v, target):
+                    mask[i] = 1
+        return mask
+
+    def select_where(self, conditions, columns: Optional[List[str]] = None,
+                     limit: Optional[int] = None, offset: int = 0,
+                     combine: str = "and") -> List[Dict[str, Any]]:
+        """Filter rows with one or more conditions, combined vectorially.
+
+        ``conditions`` is a list of ``(column, op, value)`` triples (op in
+        eq/ne/gt/gte/lt/lte/in/between) or the dict shorthand. Each condition is
+        evaluated column-at-a-time into a bitmask; masks are combined with
+        C-speed big-integer ``AND``/``OR`` (``combine``), so multi-condition
+        ``WHERE`` avoids building a row dict per row. Returns projected rows.
+        """
+        if combine not in ("and", "or"):
+            raise ValueError(f"combine must be 'and' or 'or', got {combine!r}")
+        norm = self._normalize_conditions(conditions)
+        n = self._row_count
+        if n == 0:
+            return []
+
+        if columns is None:
+            col_names = self._col_names
+        else:
+            for c in columns:
+                if c not in self.columns:
+                    raise ValueError(f"Unknown column: {c}")
+            col_names = columns
+
+        materialized: Dict[str, List[Any]] = {}
+
+        # Live rows: exclude deleted rows via the first-column-null heuristic
+        # (matching select()).
+        first_nullmask = self._col_list[0]._nullmask
+        live = bytearray(n)
+        for i in range(n):
+            if not first_nullmask[i]:
+                live[i] = 1
+        live_int = int.from_bytes(live, "little")
+
+        if not norm:
+            final_int = live_int
+        else:
+            masks = [int.from_bytes(self._condition_mask(c, op, v, materialized), "little")
+                     for (c, op, v) in norm]
+            if combine == "or":
+                comb = 0
+                for m in masks:
+                    comb |= m
+            else:
+                comb = masks[0]
+                for m in masks[1:]:
+                    comb &= m
+            final_int = comb & live_int
+
+        if final_int == 0:
+            return []
+        result = final_int.to_bytes(n, "little")
+
+        for c in col_names:
+            if c not in materialized:
+                materialized[c] = self.columns[c].tolist()
+        proj = [(name, materialized[name]) for name in col_names]
+
+        out: List[Dict[str, Any]] = []
+        matched = 0
+        for i in range(n):
+            if result[i]:
+                if matched < offset:
+                    matched += 1
+                    continue
+                out.append({name: vals[i] for name, vals in proj})
+                matched += 1
+                if limit is not None and len(out) >= limit:
+                    break
+        return out
 
     def aggregate(self,
                   column_name: str,
@@ -601,6 +893,26 @@ class ColumnarTable:
 
         if agg == "count":
             return col.count_valid()
+
+        # Vectorized path: plain (array-backed) numeric column with no nulls and
+        # no where clause. sum()/min()/max() over an array.array run in C, far
+        # faster than a Python per-element loop.
+        if where is None:
+            is_plain = (
+                not col.dtype.startswith("bytes")
+                and col.dtype != "bool"
+                and not (col._delta_mode and not col._delta_fallback)
+            )
+            if is_plain and len(col._data) > 0 and col._nullmask.count(1) == 0:
+                data = col._data
+                if agg == "sum":
+                    return sum(data)
+                if agg == "avg":
+                    return sum(data) / len(data)
+                if agg == "min":
+                    return min(data)
+                if agg == "max":
+                    return max(data)
 
         # Fast path: no where clause — iterate column directly
         if where is None:
@@ -629,49 +941,45 @@ class ColumnarTable:
                         max_val = v
                 return max_val
 
-        # Slow path: with where clause
+        # Slow path: with where clause. Materialize columns once (keeps delta
+        # columns O(n), avoids per-cell dispatch) and read the aggregate value
+        # via the materialized list — col._data[idx] is wrong for encoded
+        # columns (e.g. delta mode stores deltas, not values).
         all_cols = self._col_list
-        if agg == "sum":
-            total = 0
+        col_names = self._col_names
+        mat = {c.name: c.tolist() for c in all_cols}
+        target = mat[column_name]
+        first_nullmask = all_cols[0]._nullmask
+        col_nullmask = col._nullmask
+
+        def _matching_values():
             for idx in range(self._row_count):
-                if all_cols[0]._nullmask[idx]:
+                if first_nullmask[idx] or col_nullmask[idx]:
                     continue
-                row = {c.name: c[idx] for c in all_cols}
-                if where(row) and col._nullmask[idx] == 0:
-                    total += col._data[idx]
-            return total
+                row = {name: mat[name][idx] for name in col_names}
+                if where(row):
+                    yield target[idx]
+
+        if agg == "sum":
+            return sum(_matching_values())
         if agg == "avg":
             total = 0
             count = 0
-            for idx in range(self._row_count):
-                if all_cols[0]._nullmask[idx]:
-                    continue
-                row = {c.name: c[idx] for c in all_cols}
-                if where(row) and col._nullmask[idx] == 0:
-                    total += col._data[idx]
-                    count += 1
+            for v in _matching_values():
+                total += v
+                count += 1
             return total / count if count else 0
         if agg == "min":
             min_val = None
-            for idx in range(self._row_count):
-                if all_cols[0]._nullmask[idx]:
-                    continue
-                row = {c.name: c[idx] for c in all_cols}
-                if where(row) and col._nullmask[idx] == 0:
-                    v = col._data[idx]
-                    if min_val is None or v < min_val:
-                        min_val = v
+            for v in _matching_values():
+                if min_val is None or v < min_val:
+                    min_val = v
             return min_val
         if agg == "max":
             max_val = None
-            for idx in range(self._row_count):
-                if all_cols[0]._nullmask[idx]:
-                    continue
-                row = {c.name: c[idx] for c in all_cols}
-                if where(row) and col._nullmask[idx] == 0:
-                    v = col._data[idx]
-                    if max_val is None or v > max_val:
-                        max_val = v
+            for v in _matching_values():
+                if max_val is None or v > max_val:
+                    max_val = v
             return max_val
 
         raise ValueError(f"Unsupported aggregation: {agg}")

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "snapdb"
-version = "0.5.0"
+version = "0.6.0"
 description = "Extremely Lightweight Lightning-Fast In-Memory Database for Python"
 readme = "README.md"
 license = {text = "MIT"}
@@ -37,3 +37,25 @@ Issues = "https://github.com/hussain-alsaibai/snapdb/issues"
 where = ["."]
 include = ["snapdb*"]
 exclude = ["tests*", "benchmarks*"]
+
+[project.optional-dependencies]
+# Dev/CI only — the runtime stays zero-dependency.
+dev = ["pytest>=7", "ruff>=0.4"]
+numpy = ["numpy>=1.21"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+# Pyflakes (F) + a pragmatic slice of pycodestyle (E/W). Keep the runtime lean
+# and the lint signal high without bikeshedding on every stylistic nit.
+select = ["E", "F", "W"]
+ignore = [
+    "E501",  # line length is handled by the formatter, not enforced hard
+    "E741",  # ambiguous names (e.g. single-letter loop vars) are fine here
+]
+
+[tool.ruff.lint.per-file-ignores]
+"benchmarks/*" = ["E402"]
+"tests/*" = ["E402", "F841", "E712"]

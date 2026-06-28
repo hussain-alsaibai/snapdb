@@ -5,8 +5,6 @@ Auto-updates on insert/update/delete.
 """
 from __future__ import annotations
 
-import json
-import struct
 from typing import Any, Dict, List, Optional, Set
 
 
@@ -109,7 +107,9 @@ class MultiIndex:
         results: Optional[Set[int]] = None
         for col, val in kwargs.items():
             idx = self._indexes.get(col)
-            if not idx:
+            # Use an explicit None check: an existing-but-empty HashIndex is
+            # falsy (len 0) and must NOT be mistaken for a missing index.
+            if idx is None:
                 raise KeyError(f"No index on column: {col}")
             matches = set(idx.lookup(val))
             if results is None:
