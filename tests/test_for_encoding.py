@@ -13,10 +13,12 @@ Expected behavior:
 
 from __future__ import annotations
 
+import os
 import sys
-sys.path.insert(0, "snapdb")
 
-from snapdb.columnar import Column, ColumnarTable
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from snapdb.columnar import Column, ColumnarTable  # noqa: E402
 
 
 def test_for_threshold_sampling():
@@ -138,6 +140,69 @@ def test_for_update_fallback():
     print("✅ test_for_update_fallback")
 
 
+def test_for_out_of_range_after_activation():
+    """A value outside the sampled range must NOT be silently truncated."""
+    col = Column("age", "i32", for_encode=True, for_threshold=50)
+    for i in range(60):
+        col.append(20 + (i % 21))          # 20..40 -> FOR enabled, narrow bits
+    assert col._for_mode
+    col.append(200)                         # above range: widen, stay correct
+    assert col[col.__len__() - 1] == 200
+    col.append(-5)                          # below min: falls back to raw
+    assert col[col.__len__() - 1] == -5
+    # everything still reads back correctly
+    for i in range(60):
+        assert col[i] == 20 + (i % 21)
+    print("✅ test_for_out_of_range_after_activation")
+
+
+def test_for_widening_keeps_compression():
+    """Monotonic growth widens the bit-width instead of corrupting/raw-falling."""
+    col = Column("v", "i32", for_encode=True, for_threshold=50)
+    for v in range(100, 200):
+        col.append(v)
+    assert col._for_mode and not col._for_fallback
+    assert all(col[i] == 100 + i for i in range(100))
+    raw = Column("v", "i32")
+    for v in range(100, 200):
+        raw.append(v)
+    assert col.memory_usage() < raw.memory_usage()
+    print("✅ test_for_widening_keeps_compression")
+
+
+def test_for_nulls_after_activation():
+    """Nulls appended after FOR mode is active must not desync the packing."""
+    col = Column("x", "i32", for_encode=True, for_threshold=30)
+    for i in range(40):
+        col.append(1000 + (i % 30))         # FOR active by now
+    col.append(None)
+    col.append(1005)
+    assert col[40] is None
+    assert col[41] == 1005
+    assert all(col[i] == 1000 + (i % 30) for i in range(40))
+    print("✅ test_for_nulls_after_activation")
+
+
+def test_for_to_numpy_and_buffer():
+    """to_numpy() must materialize FOR values; buffer() must refuse FOR."""
+    import importlib.util
+    if importlib.util.find_spec("numpy") is None:
+        print("⏭  numpy not installed; skipping FOR numpy test")
+        return
+    t = ColumnarTable("t", [("x", "i32")], for_columns=["x"])
+    t.batch_insert([{"x": 1000 + (i % 50)} for i in range(60)])
+    assert t.columns["x"]._for_mode
+    arr = t.to_numpy("x")
+    assert len(arr) == 60
+    assert int(arr.sum()) == sum(1000 + (i % 50) for i in range(60))
+    try:
+        t.column_buffer("x")
+        raise AssertionError("column_buffer should raise for an encoded column")
+    except TypeError:
+        pass
+    print("✅ test_for_to_numpy_and_buffer")
+
+
 if __name__ == "__main__":
     test_for_threshold_sampling()
     test_for_memory_reduction()
@@ -145,4 +210,8 @@ if __name__ == "__main__":
     test_for_with_nulls()
     test_for_table_integration()
     test_for_update_fallback()
+    test_for_out_of_range_after_activation()
+    test_for_widening_keeps_compression()
+    test_for_nulls_after_activation()
+    test_for_to_numpy_and_buffer()
     print("\n✅ All FOR encoding tests passed!")
