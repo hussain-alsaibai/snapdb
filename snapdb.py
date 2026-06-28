@@ -227,6 +227,27 @@ class Slab:
         mv[:] = raw
         return idx
 
+    def batch_insert(self, rows: List[Dict[str, Any]]) -> int:
+        """Insert multiple rows at once. Returns index of first inserted row."""
+        n = len(rows)
+        if self._count + n > self._capacity:
+            n = self._capacity - self._count
+            rows = rows[:n]
+        if n <= 0:
+            raise RuntimeError("Slab is full")
+        start_idx = self._count
+        row_width = self.schema.row_width
+        base_offset = self._row_offset(start_idx)
+        # Encode all rows into a single buffer, then write in one shot
+        buf = bytearray(len(rows) * row_width)
+        for i, row in enumerate(rows):
+            raw = self.schema.encode_row(row)
+            buf[i * row_width : (i + 1) * row_width] = raw
+            self._live[start_idx + i] = 1
+        self._mm[base_offset : base_offset + len(buf)] = buf
+        self._count += len(rows)
+        return start_idx
+
     def update(self, idx: int, row: Dict[str, Any]) -> None:
         if idx >= self._capacity or not self._live[idx]:
             raise KeyError(f"Row {idx} not found")
@@ -484,6 +505,37 @@ class SnapDB:
             self._total_rows += 1
             self._cdc_log("insert", global_idx, row)
             return global_idx
+
+    def batch_insert(self, rows: List[Dict[str, Any]]) -> int:
+        """Insert multiple rows at once — much faster than individual inserts."""
+        if self.is_columnar():
+            return self._table.batch_insert(rows)
+        total_inserted = 0
+        remaining = rows
+        while remaining:
+            # Find slab with space
+            slab = None
+            slab_idx = -1
+            for i, s in enumerate(self._slabs):
+                if not s.is_full:
+                    slab = s
+                    slab_idx = i
+                    break
+            if slab is None:
+                self._expand()
+                slab = self._slabs[-1]
+                slab_idx = len(self._slabs) - 1
+
+            # How many can we fit in this slab?
+            space = slab.capacity - slab.count
+            chunk = remaining[:space]
+            if not chunk:
+                break
+            slab.batch_insert(chunk)
+            self._total_rows += len(chunk)
+            total_inserted += len(chunk)
+            remaining = remaining[space:]
+        return total_inserted
 
     def get(self, idx: int) -> Optional[Dict[str, Any]]:
         with self._m_time("get"):
