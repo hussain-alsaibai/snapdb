@@ -231,6 +231,21 @@ def test_for_with_delta_combination_no_corruption():
     print("✅ test_for_with_delta_combination_no_corruption")
 
 
+def test_for_unique_count():
+    """unique_count() must reconstruct FOR/delta values, not index empty _data."""
+    c = Column("u", "i32", for_encode=True, for_threshold=3)
+    for v in [100, 101, 102, 100, 103, 101]:
+        c.append(v)
+    assert c._for_mode
+    assert c.unique_count() == 4              # {100,101,102,103}
+    d = Column("t", "i64", delta_encode=True, delta_samples=3)
+    for v in [10, 20, 30, 40, 50, 50]:
+        d.append(v)
+    assert d._delta_mode
+    assert d.unique_count() == 5
+    print("✅ test_for_unique_count")
+
+
 if __name__ == "__main__":
     test_for_threshold_sampling()
     test_for_memory_reduction()
@@ -244,4 +259,5 @@ if __name__ == "__main__":
     test_for_to_numpy_and_buffer()
     test_for_update_to_none()
     test_for_with_delta_combination_no_corruption()
+    test_for_unique_count()
     print("\n✅ All FOR encoding tests passed!")

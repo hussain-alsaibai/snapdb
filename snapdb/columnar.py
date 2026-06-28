@@ -737,16 +737,13 @@ class Column:
         """Return number of unique non-null values in this column."""
         if self._dict_mode and not self._dict_fallback:
             return len(self._dict_values)
-        if self.dtype.startswith("bytes"):
-            seen = set()
-            for i in range(len(self._nullmask)):
-                if not self._nullmask[i]:
-                    seen.add(self._data[i])
-            return len(seen)
+        # Read through the value accessor so encoded columns (delta / FOR, whose
+        # raw _data array is empty) reconstruct correctly instead of IndexError-ing.
+        nullmask = self._nullmask
         seen = set()
-        for i in range(len(self._nullmask)):
-            if not self._nullmask[i]:
-                seen.add(self._data[i])
+        for i in range(len(nullmask)):
+            if not nullmask[i]:
+                seen.add(self[i])
         return len(seen)
 
 
