@@ -18,15 +18,13 @@ Measures: throughput (ops/sec), latency (ms), total time (s)
 import sys
 import os
 import time
-import json
 import sqlite3
 import tempfile
 import tracemalloc
-from typing import Any, Dict, List, Tuple, Callable
+from typing import Any, Dict, List, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from snapdb import SnapDB, Schema, ColumnDef
-from columnar import ColumnarTable
 
 try:
     import duckdb
@@ -600,9 +598,6 @@ def measure_memory(n: int) -> Dict[str, int]:
 # ── Main benchmark runner ─────────────────────────────────────────────────────
 
 def run_benchmarks():
-    engines = ["SnapDB Row", "SnapDB Row (batch)", "SnapDB Col", "SnapDB Col (batch)",
-               "SQLite (batch)", "DuckDB (DataFrame)", "Pure Dict"]
-
     print("=" * 90)
     print("  SnapDB v0.3.1 — Comprehensive Benchmark Suite")
     print("  SnapDB Row | SnapDB Columnar | SQLite | DuckDB | Pure Dict")

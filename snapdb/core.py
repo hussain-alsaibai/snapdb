@@ -76,6 +76,14 @@ def _struct_code(dtype: str) -> str:
     return _TYPE_CODES[dtype]
 
 
+def _norm_value(value: Any) -> Any:
+    """Normalize a query value to match how rows decode (bytes -> str), so
+    scan-based lookups compare equal to indexed lookups (HashIndex._key)."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
 # ── Header ─────────────────────────────────────────────────────────────────────
 
 _HEADER_FMT = "<4sHHIQ"
@@ -361,7 +369,11 @@ class SnapDB:
                  page_size: int = _DEFAULT_PAGE_SIZE,
                  storage_type: str = "row",
                  metrics: Optional[Metrics] = None,
-                 cdc: Optional[CDCLog] = None) -> None:
+                 cdc: Optional[CDCLog] = None,
+                 auto_index: bool = False,
+                 auto_index_threshold: int = 8,
+                 dict_columns: Optional[List[str]] = None,
+                 delta_columns: Optional[List[str]] = None) -> None:
         self.path = Path(path)
         self.schema = schema
         self.page_size = page_size
@@ -369,10 +381,18 @@ class SnapDB:
         self._metrics = metrics
         self._cdc = cdc
 
+        # Auto-indexing (issue #6): once a column has been queried by equality
+        # this many times, a hash index is built for it automatically.
+        self._auto_index = auto_index
+        self._auto_index_threshold = max(1, auto_index_threshold)
+        self._access_counts: Dict[str, int] = {}
+
         if storage_type == "columnar":
             if ColumnarTable is None:
                 raise RuntimeError("Columnar storage not available (columnar.py missing)")
-            self._table = ColumnarTable("columnar_store", schema.to_columnar_schema())
+            self._table = ColumnarTable(
+                "columnar_store", schema.to_columnar_schema(),
+                dict_columns=dict_columns, delta_columns=delta_columns)
             self._indexes = None
             self._wal = None
             self._slabs = None
@@ -413,8 +433,6 @@ class SnapDB:
         schema_json = json.dumps(self.schema.to_json()).encode("utf-8")
         schema_offset = _HEADER_SIZE + len(schema_json)
         bitmap_size = self._rows_per_slab
-        data_offset = schema_offset + bitmap_size
-        total_size = data_offset + self.page_size
 
         with open(self.path, "wb") as f:
             f.write(_pack_header(schema_offset, self.page_size))
@@ -607,8 +625,29 @@ class SnapDB:
     # by the _index_insert / _index_update / _index_delete helpers below so that
     # find()/lookup() never go stale after a write.
 
+    def _note_access(self, column: str) -> None:
+        """Track equality-query frequency and auto-build an index past the
+        threshold (issue #6). No-op unless auto_index was enabled."""
+        if not self._auto_index:
+            return
+        if self.is_columnar():
+            existing = getattr(self._table, "_indexes", None)
+            if existing and column in existing:
+                return
+        elif self._indexes is not None and column in self._indexes:
+            return
+        count = self._access_counts.get(column, 0) + 1
+        self._access_counts[column] = count
+        if count >= self._auto_index_threshold:
+            try:
+                self.create_index(column)
+            except (KeyError, ValueError, RuntimeError):
+                pass
+
     def lookup(self, column_name: str, value: Any) -> Optional[Dict[str, Any]]:
         """Fast lookup by indexed column — falls back to a scan if unindexed."""
+        self._note_access(column_name)
+        norm = _norm_value(value)
         if self.is_columnar():
             indexes = getattr(self._table, "_indexes", None)
             if indexes is not None and column_name in indexes:
@@ -616,7 +655,7 @@ class SnapDB:
                 return self._table.get(idx) if idx is not None else None
             col = self._table.columns[column_name]
             for i in range(self._table._row_count):
-                if col._nullmask[i] == 0 and col[i] == value:
+                if col._nullmask[i] == 0 and col[i] == norm:
                     return self._table.get(i)
             return None
 
@@ -626,7 +665,7 @@ class SnapDB:
                 return self.get(row_indices[0])
             return None
         for idx, row in self:
-            if row.get(column_name) == value:
+            if row.get(column_name) == norm:
                 return row
         return None
 
@@ -798,6 +837,32 @@ class SnapDB:
             raise RuntimeError("select_column requires columnar storage")
         return self._table.select_column(column_name)
 
+    def select_where(self, conditions, columns=None, limit=None, offset=0,
+                     combine="and"):
+        """Vectorized multi-condition filter (columnar only). See
+        :meth:`ColumnarTable.select_where`."""
+        if not self.is_columnar():
+            raise RuntimeError("select_where requires columnar storage")
+        # Auto-indexing watches single-column equality filters too.
+        if self._auto_index:
+            for col, op, _ in self._table._normalize_conditions(conditions):
+                if op in ("eq", "=="):
+                    self._note_access(col)
+        return self._table.select_where(conditions, columns=columns, limit=limit,
+                                        offset=offset, combine=combine)
+
+    def to_numpy(self, column_name: str, zero_copy: bool = False):
+        """Export a column as a NumPy array (columnar only; requires numpy)."""
+        if not self.is_columnar():
+            raise RuntimeError("to_numpy requires columnar storage")
+        return self._table.to_numpy(column_name, zero_copy=zero_copy)
+
+    def column_buffer(self, column_name: str) -> memoryview:
+        """Zero-copy buffer over a plain numeric column (columnar only)."""
+        if not self.is_columnar():
+            raise RuntimeError("column_buffer requires columnar storage")
+        return self._table.column_buffer(column_name)
+
     def memory_usage(self) -> int:
         """Memory usage in bytes (columnar only)."""
         if not self.is_columnar():
@@ -840,14 +905,31 @@ class SnapDB:
             self._indexes.drop(column)
 
     def find(self, **kwargs) -> List[Dict[str, Any]]:
+        """Return all rows matching every column=value pair.
+
+        Uses hash indexes when all queried columns are indexed; otherwise falls
+        back to a scan (so it works without create_index()). With auto_index
+        enabled, frequently-queried columns get indexed automatically.
+        """
         if self.is_columnar():
             raise RuntimeError("Find by index not supported in columnar storage")
         if self._indexes is None:
             raise RuntimeError("Indexing not available (index.py missing)")
-        row_indices = self._indexes.lookup(**kwargs)
-        if row_indices is None:
+        if not kwargs:
             return []
-        return [self.get(i) for i in row_indices]
+        for column in kwargs:
+            if column not in self.schema._name_to_idx:
+                raise KeyError(f"Unknown column: {column}")
+            self._note_access(column)
+        if all(column in self._indexes for column in kwargs):
+            row_indices = self._indexes.lookup(**kwargs)
+            if row_indices is None:
+                return []
+            return [self.get(i) for i in row_indices]
+        # Scan fallback when one or more columns are not indexed.
+        wanted = {k: _norm_value(v) for k, v in kwargs.items()}
+        return [row for _, row in self
+                if all(row.get(k) == v for k, v in wanted.items())]
 
     @contextmanager
     def transaction(self):
