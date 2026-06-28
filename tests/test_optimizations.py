@@ -75,6 +75,26 @@ class TestHashIndexMaintenance(unittest.TestCase):
         finally:
             db.close()
 
+    def test_lookup_find_on_emptied_index(self):
+        # Regression: an index that has been fully emptied (last matching row
+        # deleted) must not be mistaken for a missing index — lookup()/find()
+        # should return None/[] rather than raising KeyError.
+        db = SnapDB(self.path, self.schema)
+        try:
+            db.create_index("name")
+            i = db.insert({"id": 1, "name": b"alice", "score": 1.0})
+            db.delete(i)
+            self.assertIsNone(db.lookup("name", b"alice"))
+            self.assertEqual(db.find(name=b"alice"), [])
+            # a genuinely missing index still raises
+            with self.assertRaises(KeyError):
+                db.find(nope=b"x")
+            # re-inserting repopulates the same index
+            db.insert({"id": 2, "name": b"alice", "score": 2.0})
+            self.assertEqual(len(db.find(name=b"alice")), 1)
+        finally:
+            db.close()
+
     def test_batch_insert_maintains_index(self):
         db = SnapDB(self.path, self.schema)
         try:
