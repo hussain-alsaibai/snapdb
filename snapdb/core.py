@@ -199,6 +199,8 @@ class Schema:
 class Slab:
     """Memory-mapped slab holding rows in a contiguous buffer."""
 
+    __slots__ = ("schema", "_mm", "_offset", "_capacity", "_count", "_live")
+
     def __init__(self, schema: Schema, mm: mmap.mmap, offset: int, capacity: int) -> None:
         self.schema = schema
         self._mm = mm
@@ -516,9 +518,7 @@ class SnapDB:
             if self.is_columnar():
                 idx = self._table.insert(row)
                 self._cdc_log("insert", idx, row)
-                # Update index if exists
-                if hasattr(self._table, '_indexes'):
-                    self._update_index(idx, row)
+                self._index_insert(idx, row)
                 return idx
             for slab_idx, slab in enumerate(self._slabs):
                 if not slab.is_full:
@@ -526,22 +526,29 @@ class SnapDB:
                     global_idx = slab_idx * self._rows_per_slab + local_idx
                     self._total_rows += 1
                     self._cdc_log("insert", global_idx, row)
-                    if hasattr(self, '_idx_cache'):
-                        self._update_index(global_idx, row)
+                    self._index_insert(global_idx, row)
+                    if self._in_tx:
+                        self._tx_state.append(("insert", global_idx, dict(row)))
                     return global_idx
             self._expand()
             idx = self._slabs[-1].insert(row)
             global_idx = (len(self._slabs) - 1) * self._rows_per_slab + idx
             self._total_rows += 1
             self._cdc_log("insert", global_idx, row)
-            if hasattr(self, '_idx_cache'):
-                self._update_index(global_idx, row)
+            self._index_insert(global_idx, row)
+            if self._in_tx:
+                self._tx_state.append(("insert", global_idx, dict(row)))
             return global_idx
 
     def batch_insert(self, rows: List[Dict[str, Any]]) -> int:
         """Insert multiple rows at once — much faster than individual inserts."""
         if self.is_columnar():
-            return self._table.batch_insert(rows)
+            start_idx = self._table.batch_insert(rows)
+            if getattr(self._table, "_indexes", None):
+                for offset, row in enumerate(rows):
+                    self._index_insert(start_idx + offset, row)
+            return start_idx
+        has_indexes = self._indexes is not None and len(self._indexes._indexes) > 0
         total_inserted = 0
         remaining = rows
         while remaining:
@@ -563,7 +570,11 @@ class SnapDB:
             chunk = remaining[:space]
             if not chunk:
                 break
-            slab.batch_insert(chunk)
+            local_start = slab.batch_insert(chunk)
+            if has_indexes:
+                base = slab_idx * self._rows_per_slab + local_start
+                for offset, row in enumerate(chunk):
+                    self._index_insert(base + offset, row)
             self._total_rows += len(chunk)
             total_inserted += len(chunk)
             remaining = remaining[space:]
@@ -590,86 +601,81 @@ class SnapDB:
             return self._slabs[slab_idx].get_raw(local_idx)
 
     # ── Hash Index (in-memory, optional) ─────────────────────────────────────
-
-    def create_index(self, column_name: str) -> None:
-        """Create an in-memory hash index on a column for fast lookups."""
-        if self.is_columnar():
-            if not hasattr(self._table, '_indexes'):
-                self._table._indexes = {}
-            self._table._indexes[column_name] = {}
-            for i in range(self._table._row_count):
-                col = self._table.columns[column_name]
-                if col._nullmask[i] == 0:
-                    val = col[i]
-                    self._table._indexes[column_name][val] = i
-            return
-
-        if not hasattr(self, '_idx_cache'):
-            self._idx_cache: Dict[str, Dict[Any, int]] = {}
-        self._idx_cache[column_name] = {}
-        for slab_idx, slab in enumerate(self._slabs):
-            for local_idx in range(slab.count):
-                if not slab._live[local_idx]:
-                    continue
-                start = slab._row_offset(local_idx)
-                end = start + self.schema.row_width
-                row = self.schema.decode_row(memoryview(slab._mm)[start:end])
-                val = row.get(column_name)
-                if val is not None:
-                    global_idx = slab_idx * self._rows_per_slab + local_idx
-                    self._idx_cache[column_name][val] = global_idx
+    #
+    # Row storage uses the O(1) MultiIndex (index.py). Columnar storage uses a
+    # plain ``value -> row_idx`` dict held on the table. Both are kept in sync
+    # by the _index_insert / _index_update / _index_delete helpers below so that
+    # find()/lookup() never go stale after a write.
 
     def lookup(self, column_name: str, value: Any) -> Optional[Dict[str, Any]]:
-        """Fast lookup by indexed column — requires create_index() first."""
+        """Fast lookup by indexed column — falls back to a scan if unindexed."""
         if self.is_columnar():
-            if hasattr(self._table, '_indexes') and column_name in self._table._indexes:
-                idx = self._table._indexes[column_name].get(value)
-                if idx is not None:
-                    return self._table.get(idx)
+            indexes = getattr(self._table, "_indexes", None)
+            if indexes is not None and column_name in indexes:
+                idx = indexes[column_name].get(value)
+                return self._table.get(idx) if idx is not None else None
+            col = self._table.columns[column_name]
             for i in range(self._table._row_count):
-                col = self._table.columns[column_name]
                 if col._nullmask[i] == 0 and col[i] == value:
                     return self._table.get(i)
             return None
 
-        if hasattr(self, '_idx_cache') and column_name in self._idx_cache:
-            idx = self._idx_cache[column_name].get(value)
-            if idx is not None:
-                return self.get(idx)
-        for slab_idx, slab in enumerate(self._slabs):
-            for local_idx in range(slab.count):
-                if not slab._live[local_idx]:
-                    continue
-                start = slab._row_offset(local_idx)
-                end = start + self.schema.row_width
-                row = self.schema.decode_row(memoryview(slab._mm)[start:end])
-                if row.get(column_name) == value:
-                    return row
+        if self._indexes is not None and column_name in self._indexes:
+            row_indices = self._indexes.lookup(**{column_name: value})
+            if row_indices:
+                return self.get(row_indices[0])
+            return None
+        for idx, row in self:
+            if row.get(column_name) == value:
+                return row
         return None
 
-    def _update_index(self, idx: int, row: Dict[str, Any]) -> None:
-        """Update index entries after insert/update/delete."""
+    def _index_insert(self, idx: int, row: Dict[str, Any]) -> None:
+        """Maintain indexes after an insert."""
         if self.is_columnar():
-            if hasattr(self._table, '_indexes'):
-                for col_name, idx_map in self._table._indexes.items():
-                    if col_name in row:
-                        val = row[col_name]
-                        for k, v in list(idx_map.items()):
-                            if v == idx:
-                                del idx_map[k]
-                                break
-                        idx_map[val] = idx
+            indexes = getattr(self._table, "_indexes", None)
+            if indexes:
+                for col_name in indexes:
+                    val = self._table.columns[col_name][idx]
+                    if val is not None:
+                        indexes[col_name][val] = idx
             return
+        if self._indexes is not None:
+            for hidx in self._indexes._indexes.values():
+                hidx.insert(idx, row)
 
-        if hasattr(self, '_idx_cache'):
-            for col_name, idx_map in self._idx_cache.items():
-                if col_name in row:
-                    val = row[col_name]
-                    for k, v in list(idx_map.items()):
-                        if v == idx:
-                            del idx_map[k]
-                            break
-                    idx_map[val] = idx
+    def _index_update(self, idx: int, old_row: Optional[Dict[str, Any]],
+                      new_row: Dict[str, Any]) -> None:
+        """Maintain indexes after an update (old_row may be None)."""
+        if self.is_columnar():
+            indexes = getattr(self._table, "_indexes", None)
+            if indexes:
+                for col_name, idx_map in indexes.items():
+                    if old_row is not None:
+                        old_val = old_row.get(col_name)
+                        if old_val is not None and idx_map.get(old_val) == idx:
+                            del idx_map[old_val]
+                    new_val = self._table.columns[col_name][idx]
+                    if new_val is not None:
+                        idx_map[new_val] = idx
+            return
+        if self._indexes is not None and old_row is not None:
+            for hidx in self._indexes._indexes.values():
+                hidx.update(idx, old_row, new_row)
+
+    def _index_delete(self, idx: int, row: Optional[Dict[str, Any]]) -> None:
+        """Maintain indexes after a delete."""
+        if self.is_columnar():
+            indexes = getattr(self._table, "_indexes", None)
+            if indexes and row is not None:
+                for col_name, idx_map in indexes.items():
+                    val = row.get(col_name)
+                    if val is not None and idx_map.get(val) == idx:
+                        del idx_map[val]
+            return
+        if self._indexes is not None and row is not None:
+            for hidx in self._indexes._indexes.values():
+                hidx.delete(idx, row)
 
     def update(self, idx: int, row: Dict[str, Any]) -> None:
         with self._m_time("update"):
@@ -677,8 +683,7 @@ class SnapDB:
                 old = self._table.get(idx)
                 self._table.update(idx, row)
                 self._cdc_log("update", idx, row, old)
-                if hasattr(self, '_idx_cache'):
-                    self._update_index(idx, row)
+                self._index_update(idx, old, row)
                 return
             slab_idx = idx // self._rows_per_slab
             local_idx = idx % self._rows_per_slab
@@ -687,8 +692,9 @@ class SnapDB:
             old_row = self._slabs[slab_idx].get(local_idx)
             self._slabs[slab_idx].update(local_idx, row)
             self._cdc_log("update", idx, row, old_row)
-            if hasattr(self, '_idx_cache'):
-                self._update_index(idx, row)
+            self._index_update(idx, old_row, row)
+            if self._in_tx:
+                self._tx_state.append(("update", idx, old_row))
 
     def delete(self, idx: int) -> None:
         with self._m_time("delete"):
@@ -696,12 +702,7 @@ class SnapDB:
                 old = self._table.get(idx)
                 self._table.delete(idx)
                 self._cdc_log("delete", idx, None, old)
-                if hasattr(self._table, '_indexes'):
-                    for idx_map in self._table._indexes.values():
-                        for k, v in list(idx_map.items()):
-                            if v == idx:
-                                del idx_map[k]
-                                break
+                self._index_delete(idx, old)
                 return
             slab_idx = idx // self._rows_per_slab
             local_idx = idx % self._rows_per_slab
@@ -711,12 +712,9 @@ class SnapDB:
             self._slabs[slab_idx].delete(local_idx)
             self._total_rows -= 1
             self._cdc_log("delete", idx, None, old_row)
-            if hasattr(self, '_idx_cache'):
-                for idx_map in self._idx_cache.values():
-                    for k, v in list(idx_map.items()):
-                        if v == idx:
-                            del idx_map[k]
-                            break
+            self._index_delete(idx, old_row)
+            if self._in_tx:
+                self._tx_state.append(("delete", idx, old_row))
 
     def query(self, predicate: Callable[[Dict[str, Any]], bool]) -> Iterator[Tuple[int, Dict[str, Any]]]:
         with self._m_time("query"):
@@ -751,21 +749,34 @@ class SnapDB:
 
     def close(self) -> None:
         import gc
-        gc.collect()
-        if self._mm:
+        # Slabs each hold a reference to the mmap, which would keep the mapping
+        # alive (and the file locked on Windows) even after we drop our own
+        # reference. Release those first so mmap.close() can actually unmap.
+        if self._slabs:
+            for slab in self._slabs:
+                slab._mm = None
+            self._slabs = []
+        if self._mm is not None:
             self._mm.flush()
             try:
                 self._mm.close()
             except BufferError:
-                pass
+                # A caller still holds a memoryview (e.g. from get_raw); fall back
+                # to dropping our reference and letting GC unmap it.
+                gc.collect()
+                try:
+                    self._mm.close()
+                except BufferError:
+                    pass
             self._mm = None
-        if self._file:
+        if self._file is not None:
             self._file.close()
             self._file = None
         if self._wal is not None:
             self._wal.close()
         if self._cdc is not None:
             self._cdc.close()
+        gc.collect()
 
     # ── Columnar-specific methods ─────────────────────────────────────────────
 
@@ -796,15 +807,31 @@ class SnapDB:
     # ── Row-only methods (indexing, transactions) ────────────────────────────
 
     def create_index(self, column: str) -> None:
+        """Build an in-memory hash index on a column for O(1) lookups.
+
+        Kept in sync automatically on insert/update/delete. Works for both row
+        and columnar storage.
+        """
         if self.is_columnar():
-            raise RuntimeError("Indexing not supported in columnar storage")
+            if column not in self._table.columns:
+                raise KeyError(f"Unknown column: {column}")
+            if not hasattr(self._table, "_indexes"):
+                self._table._indexes = {}
+            col = self._table.columns[column]
+            index: Dict[Any, int] = {}
+            for i in range(self._table._row_count):
+                if col._nullmask[i] == 0:
+                    index[col[i]] = i
+            self._table._indexes[column] = index
+            return
         if self._indexes is None:
             raise RuntimeError("Indexing not available (index.py missing)")
         if column in self._indexes:
             return
         self._indexes.create(column)
+        hidx = self._indexes._indexes[column]
         for idx, row in self:
-            self._indexes._indexes[column].insert(idx, row)
+            hidx.insert(idx, row)
 
     def drop_index(self, column: str) -> None:
         if self.is_columnar():
@@ -844,6 +871,9 @@ class SnapDB:
     def _tx_rollback(self) -> None:
         if not self._in_tx:
             return
+        # Roll back in reverse order. We must clear _in_tx first so the
+        # index-maintenance helpers below don't try to re-record undo entries.
+        self._in_tx = False
         for op, idx, data in reversed(self._tx_state):
             if op == "insert":
                 slab_idx = idx // self._rows_per_slab
@@ -851,11 +881,14 @@ class SnapDB:
                 if slab_idx < len(self._slabs):
                     self._slabs[slab_idx].delete(local_idx)
                     self._total_rows -= 1
+                    self._index_delete(idx, data)
             elif op == "update" and data is not None:
                 slab_idx = idx // self._rows_per_slab
                 local_idx = idx % self._rows_per_slab
                 if slab_idx < len(self._slabs):
+                    current = self._slabs[slab_idx].get(local_idx)
                     self._slabs[slab_idx].update(local_idx, data)
+                    self._index_update(idx, current, data)
             elif op == "delete" and data is not None:
                 slab_idx = idx // self._rows_per_slab
                 local_idx = idx % self._rows_per_slab
@@ -866,6 +899,7 @@ class SnapDB:
                     mv[:] = raw
                     self._slabs[slab_idx]._live[local_idx] = 1
                     self._total_rows += 1
+                    self._index_insert(idx, data)
         self._in_tx = False
         self._tx_state = []
         if self._wal is not None:
