@@ -6,11 +6,14 @@ Zero-dependency, pure Python.
 v0.3.1: Optimized batch operations, precomputed column lists, faster iteration.
 v0.4.0: Dictionary encoding for low-cardinality string columns.
 v0.5.0: Delta encoding for monotonic numeric columns.
+v0.6.0: Vectorized filtering, auto-indexing, NumPy export.
+v0.7.0: Frame-of-Reference + bit packing for bounded numeric ranges.
 """
 
 from __future__ import annotations
 
 import array
+import math
 import operator
 from typing import Any, Dict, List, Tuple, Callable, Iterator, Optional
 
@@ -40,6 +43,9 @@ _TYPE_SIZES = {
 
 # Numeric types eligible for delta encoding
 _DELTA_ELIGIBLE = {"i32", "i64", "u32", "u64"}
+
+# Numeric types eligible for Frame-of-Reference encoding
+_FOR_ELIGIBLE = {"i32", "i64", "u32", "u64"}
 
 # Integer types eligible for Frame-of-Reference (FOR) encoding
 _FOR_ELIGIBLE = {"i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"}
@@ -107,12 +113,15 @@ class Column:
         "_dict", "_dict_values", "_dict_codes",
         "_delta_encode", "_delta_samples", "_delta_mode", "_delta_fallback",
         "_delta_base", "_delta_prev", "_deltas", "_delta_typecode", "_delta_cache",
+        "_for_encode", "_for_threshold", "_for_mode", "_for_fallback",
+        "_for_stats", "_for_min", "_for_bits", "_for_mask", "_for_packed", "_for_count",
         "_data", "_nullmask",
     )
 
     def __init__(self, name: str, dtype: str,
                  dict_encode: bool = False, dict_threshold: int = 256,
-                 delta_encode: bool = False, delta_samples: int = 50) -> None:
+                 delta_encode: bool = False, delta_samples: int = 50,
+                 for_encode: bool = False, for_threshold: int = 50) -> None:
         self.name = name
         self.dtype = dtype
         self.width = _type_size(dtype)
@@ -137,6 +146,17 @@ class Column:
         # read after a write so random access / scans are O(1) / O(n) instead
         # of O(n) / O(n^2). Invalidated (set to None) whenever deltas change.
         self._delta_cache: Optional[array.array] = None
+        # Frame-of-Reference encoding config
+        self._for_encode = for_encode and dtype in _FOR_ELIGIBLE
+        self._for_threshold = for_threshold
+        self._for_mode: bool = False           # True when using FOR encoding
+        self._for_fallback: bool = False       # True when FOR disabled (range too large)
+        self._for_stats: Optional[Dict[str, Any]] = None  # min/max tracking during sampling
+        self._for_min: int = 0
+        self._for_bits: int = 0
+        self._for_mask: int = 0
+        self._for_packed: int = 0
+        self._for_count: int = 0
         self._data: Any = None
         self._nullmask: Optional[array.array] = None
         self._init_storage()
@@ -272,6 +292,57 @@ class Column:
         self._deltas = new_arr
         self._delta_typecode = new_tc
 
+    def _start_for_mode(self) -> None:
+        """Switch to Frame-of-Reference bit-packing mode."""
+        self._for_mode = True
+        self._for_min = self._for_stats["min"]
+        max_val = self._for_stats["max"]
+        range_val = max_val - self._for_min
+        if range_val <= 0:
+            # All values identical - use 1 bit per value (0)
+            self._for_bits = 1
+            self._for_mask = 1
+        else:
+            # Number of bits needed per value
+            bits = max(1, range_val.bit_length())
+            self._for_bits = bits
+            self._for_mask = (1 << bits) - 1
+        self._for_packed = 0  # Python int bitmask for packed values
+        self._for_count = 0
+        # Convert existing raw data to FOR packed format
+        old_data = list(self._data)
+        self._data = array.array(_array_typecode(self.dtype))
+        for v in old_data:
+            self._append_for(v)
+
+    def _append_for(self, value: int) -> None:
+        """Append value using FOR bit-packing."""
+        delta = value - self._for_min
+        # Pack delta into the bitmask at the correct position
+        bit_pos = self._for_count * self._for_bits
+        self._for_packed |= (delta & self._for_mask) << bit_pos
+        self._for_count += 1
+
+    def _get_for_value(self, idx: int) -> int:
+        """Reconstruct value from FOR encoding at index."""
+        bit_pos = idx * self._for_bits
+        delta = (self._for_packed >> bit_pos) & self._for_mask
+        return self._for_min + delta
+
+    def _convert_for_to_raw(self) -> None:
+        """Convert from FOR mode back to raw storage."""
+        if not self._for_mode or self._for_fallback:
+            return
+        self._for_fallback = True
+        # Reconstruct full values from FOR packed data
+        raw = array.array(_array_typecode(self.dtype))
+        for i in range(self._for_count):
+            raw.append(self._get_for_value(i))
+        self._data = raw
+        self._for_mode = False
+        self._for_packed = 0
+        self._for_count = 0
+
     def _append_delta(self, value: int) -> None:
         """Append value using delta encoding."""
         self._delta_cache = None  # invalidate reconstruction cache
@@ -366,6 +437,32 @@ class Column:
                 else:
                     # Already in delta mode
                     self._append_delta(value)
+            elif self._for_encode and not self._for_fallback:
+                # Frame-of-Reference encoding path
+                if not self._for_mode:
+                    # Still in sampling phase
+                    self._data.append(value)
+                    # Track min/max during sampling
+                    if self._for_stats is None:
+                        self._for_stats = {"min": value, "max": value, "samples": []}
+                    self._for_stats["samples"].append(value)
+                    if value < self._for_stats["min"]:
+                        self._for_stats["min"] = value
+                    if value > self._for_stats["max"]:
+                        self._for_stats["max"] = value
+                    # Check if we should enable FOR mode
+                    if len(self._for_stats["samples"]) >= self._for_threshold:
+                        range_val = self._for_stats["max"] - self._for_stats["min"]
+                        # Only enable if we save at least 50% space
+                        # i32 = 32 bits, so FOR must use <= 16 bits per value
+                        if range_val.bit_length() <= 16:
+                            self._start_for_mode()
+                        else:
+                            self._for_fallback = True
+                            self._for_stats = None
+                else:
+                    # Already in FOR mode
+                    self._append_for(value)
             else:
                 self._data.append(value)
 
@@ -389,6 +486,8 @@ class Column:
             return bool((self._data >> idx) & 1)
         if self._delta_mode and not self._delta_fallback:
             return self._get_delta_value(idx)
+        if self._for_mode and not self._for_fallback:
+            return self._get_for_value(idx)
         return self._data[idx]
 
     def __setitem__(self, idx: int, value: Any) -> None:
@@ -434,6 +533,11 @@ class Column:
                 # For now, convert to raw on update
                 self._convert_delta_to_raw()
                 self._data[idx] = value
+            elif self._for_mode and not self._for_fallback:
+                # FOR mode: update is expensive (must repack)
+                # For now, convert to raw on update
+                self._convert_for_to_raw()
+                self._data[idx] = value
             else:
                 self._data[idx] = value
 
@@ -448,6 +552,7 @@ class Column:
         is_bool = self.dtype == "bool"
         is_dict = self._dict_mode and not self._dict_fallback
         is_delta = self._delta_mode and not self._delta_fallback
+        is_for = self._for_mode and not self._for_fallback
         if is_delta:
             # Reconstruct once (O(n)); previously this re-summed per element (O(n^2)).
             data = self._ensure_delta_cache()
@@ -459,6 +564,8 @@ class Column:
                     yield i, data[i].decode("utf-8", errors="replace")
                 elif is_bool:
                     yield i, bool((data >> i) & 1)
+                elif is_for:
+                    yield i, self._get_for_value(i)
                 else:
                     yield i, data[i]
 
@@ -485,6 +592,8 @@ class Column:
                     for i in range(n)]
         if self._delta_mode and not self._delta_fallback:
             data = self._ensure_delta_cache()
+        elif self._for_mode and not self._for_fallback:
+            data = [self._get_for_value(i) for i in range(n)]
         else:
             data = self._data
         return [None if nullmask[i] else data[i] for i in range(n)]
@@ -563,6 +672,9 @@ class Column:
         elif self._delta_mode and not self._delta_fallback:
             # Delta mode: base + deltas array
             return 8 + len(self._deltas) * self._deltas.itemsize + len(self._nullmask)  # type: ignore
+        elif self._for_mode and not self._for_fallback:
+            # FOR mode: packed int bitmask + metadata
+            return (self._for_packed.bit_length() + 7) // 8 + 32 + len(self._nullmask)
         else:
             return len(self._data) * self._data.itemsize + len(self._nullmask)
 
@@ -590,24 +702,31 @@ class ColumnarTable:
 
     v0.4.0: Dictionary encoding for low-cardinality string columns.
     v0.5.0: Delta encoding for monotonic numeric columns.
+    v0.6.0: Vectorized filtering, auto-indexing, NumPy export.
+    v0.7.0: Frame-of-Reference + bit packing for bounded numeric ranges.
     """
 
     def __init__(self, name: str, schema: List[Tuple[str, str]],
                  dict_columns: Optional[List[str]] = None,
                  dict_threshold: int = 256,
-                 delta_columns: Optional[List[str]] = None) -> None:
+                 delta_columns: Optional[List[str]] = None,
+                 for_columns: Optional[List[str]] = None,
+                 for_threshold: int = 50) -> None:
         self.name = name
         self.columns: Dict[str, Column] = {}
         self._col_list: List[Column] = []
         self._col_names: List[str] = []
         dict_cols = set(dict_columns or [])
         delta_cols = set(delta_columns or [])
+        for_cols = set(for_columns or [])
         for col_name, col_type in schema:
             use_dict = col_name in dict_cols
             use_delta = col_name in delta_cols
+            use_for = col_name in for_cols
             col = Column(col_name, col_type,
                          dict_encode=use_dict, dict_threshold=dict_threshold,
-                         delta_encode=use_delta)
+                         delta_encode=use_delta,
+                         for_encode=use_for, for_threshold=for_threshold)
             self.columns[col_name] = col
             self._col_list.append(col)
             self._col_names.append(col_name)
@@ -674,6 +793,10 @@ class ColumnarTable:
             elif col._delta_mode and not col._delta_fallback:
                 # Delta values are cumulative — mutating a delta would corrupt
                 # every later row. The nullmask alone marks the row deleted.
+                pass
+            elif col._for_mode and not col._for_fallback:
+                # FOR values are bit-packed — mutating would corrupt packing.
+                # The nullmask alone marks the row deleted.
                 pass
             elif hasattr(col._data, 'typecode') and col._data.typecode in ("f", "d"):
                 col._data[idx] = 0.0
