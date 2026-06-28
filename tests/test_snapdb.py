@@ -10,7 +10,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from snapdb import SnapDB, Schema, ColumnDef, Metrics, ColumnarTable
+from snapdb import SnapDB, Schema, ColumnDef, Metrics
 
 PASS = 0
 FAIL = 0
@@ -327,7 +327,7 @@ if __name__ == "__main__":
     test_cdc()
     test_cdc_file()
     test_benchmark()
-    print(f"\n╔══════════ Results ══════════╗")
+    print("\n╔══════════ Results ══════════╗")
     print(f"  ✅ Passed: {PASS}")
     print(f"  ❌ Failed: {FAIL}")
     print(f"  Total:    {PASS + FAIL}")

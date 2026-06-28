@@ -11,7 +11,18 @@ v0.5.0: Delta encoding for monotonic numeric columns.
 from __future__ import annotations
 
 import array
+import operator
 from typing import Any, Dict, List, Tuple, Callable, Iterator, Optional
+
+# Comparison operators for vectorized predicates (issue #4)
+_FILTER_OPS = {
+    "eq": operator.eq, "==": operator.eq,
+    "ne": operator.ne, "!=": operator.ne,
+    "gt": operator.gt, ">": operator.gt,
+    "gte": operator.ge, ">=": operator.ge,
+    "lt": operator.lt, "<": operator.lt,
+    "lte": operator.le, "<=": operator.le,
+}
 
 _TYPE_CODES = {
     "i8": "b", "i16": "h", "i32": "i", "i64": "q",
@@ -29,6 +40,16 @@ _TYPE_SIZES = {
 
 # Numeric types eligible for delta encoding
 _DELTA_ELIGIBLE = {"i32", "i64", "u32", "u64"}
+
+# Integer types eligible for Frame-of-Reference (FOR) encoding
+_FOR_ELIGIBLE = {"i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"}
+
+# array.array typecode -> NumPy dtype string, for zero-copy export (PEP 688 / #7)
+_NUMPY_DTYPE = {
+    "b": "int8", "B": "uint8", "h": "int16", "H": "uint16",
+    "i": "int32", "I": "uint32", "q": "int64", "Q": "uint64",
+    "f": "float32", "d": "float64",
+}
 
 
 def _type_size(dtype: str) -> int:
@@ -471,6 +492,58 @@ class Column:
     def count_valid(self) -> int:
         return self._nullmask.count(0)
 
+    # ── Zero-copy / NumPy interop (issue #7) ─────────────────────────────────
+
+    def _is_plain_numeric(self) -> bool:
+        """True when values live in a contiguous array.array (no encoding)."""
+        return (
+            not self.dtype.startswith("bytes")
+            and self.dtype != "bool"
+            and not (self._dict_mode and not self._dict_fallback)
+            and not (self._delta_mode and not self._delta_fallback)
+        )
+
+    def buffer(self) -> memoryview:
+        """Zero-copy ``memoryview`` over the raw numeric buffer.
+
+        Only available for plain (un-encoded) numeric columns. While the
+        returned view is alive the column cannot grow — the underlying
+        ``array.array`` is locked against resizing by the buffer export — so
+        release the view before further inserts. Null entries are not masked;
+        pair with :meth:`null_mask`.
+        """
+        if not self._is_plain_numeric():
+            raise TypeError(
+                f"zero-copy buffer unavailable for column {self.name!r} "
+                f"(dtype={self.dtype}; encoded or non-numeric) — use to_numpy()"
+            )
+        return memoryview(self._data)
+
+    def __buffer__(self, flags):  # PEP 688 (Python 3.12+)
+        return self.buffer()
+
+    def to_numpy(self, zero_copy: bool = False):
+        """Export the column as a NumPy array (requires ``numpy``).
+
+        ``zero_copy=True`` returns a view that shares memory with the column
+        (plain numeric columns only; see :meth:`buffer` for the lifetime
+        caveat). The default returns a safe copy that also works for encoded
+        columns; null entries come back as the column's zero value unless the
+        column contains nulls, in which case an ``object`` array with ``None``
+        is returned. Use :meth:`null_mask` for validity.
+        """
+        import numpy as np  # optional dependency, imported lazily
+
+        if zero_copy and self._is_plain_numeric():
+            return np.frombuffer(self.buffer(), dtype=_NUMPY_DTYPE[self._data.typecode])
+        if self._is_plain_numeric() and self._nullmask.count(1) == 0:
+            return np.asarray(self._data, dtype=_NUMPY_DTYPE[self._data.typecode])
+        return np.asarray(self.tolist(), dtype=object)
+
+    def null_mask(self) -> List[bool]:
+        """Return the validity bitmap as a list of bools (True == null)."""
+        return [bool(x) for x in self._nullmask]
+
     def memory_usage(self) -> int:
         if self.dtype.startswith("bytes"):
             if self._dict_mode and not self._dict_fallback:
@@ -658,6 +731,155 @@ class ColumnarTable:
             raise ValueError(f"Unknown column: {column_name}")
         # tolist() is a single O(n) pass (and O(n) — not O(n^2) — for delta cols).
         return self.columns[column_name].tolist()
+
+    def to_numpy(self, column_name: str, zero_copy: bool = False):
+        """Export a column as a NumPy array (requires ``numpy``). See
+        :meth:`Column.to_numpy`."""
+        if column_name not in self.columns:
+            raise ValueError(f"Unknown column: {column_name}")
+        return self.columns[column_name].to_numpy(zero_copy=zero_copy)
+
+    def column_buffer(self, column_name: str) -> memoryview:
+        """Zero-copy ``memoryview`` over a plain numeric column's raw buffer."""
+        if column_name not in self.columns:
+            raise ValueError(f"Unknown column: {column_name}")
+        return self.columns[column_name].buffer()
+
+    # ── Vectorized multi-condition filter (issue #4) ─────────────────────────
+
+    def _normalize_conditions(self, conditions) -> List[Tuple[str, str, Any]]:
+        """Accept either a list of ``(column, op, value)`` triples or a dict
+        ``{column: value}`` / ``{column: {op: value}}`` and return triples."""
+        norm: List[Tuple[str, str, Any]] = []
+        if isinstance(conditions, dict):
+            for col, spec in conditions.items():
+                if isinstance(spec, dict):
+                    for op, val in spec.items():
+                        norm.append((col, op, val))
+                else:
+                    norm.append((col, "eq", spec))
+        else:
+            for cond in conditions:
+                if len(cond) != 3:
+                    raise ValueError(f"condition must be (column, op, value): {cond!r}")
+                norm.append((cond[0], cond[1], cond[2]))
+        for col, op, _ in norm:
+            if col not in self.columns:
+                raise ValueError(f"Unknown column: {col}")
+            if op not in _FILTER_OPS and op not in ("in", "between"):
+                raise ValueError(f"Unsupported operator: {op!r}")
+        return norm
+
+    def _condition_mask(self, col_name: str, op: str, value: Any,
+                        materialized: Dict[str, List[Any]]) -> bytearray:
+        """Build a 1-byte-per-row match mask for a single condition."""
+        col = self.columns[col_name]
+        vals = materialized.get(col_name)
+        if vals is None:
+            vals = col.tolist()
+            materialized[col_name] = vals
+
+        # bytes columns materialize to decoded str — normalize comparison
+        # values (given as bytes or str) the same way so they compare equal.
+        if col.dtype.startswith("bytes"):
+            def _conv(x):
+                return x.decode("utf-8", errors="replace") if isinstance(x, bytes) else x
+        else:
+            def _conv(x):
+                return x
+
+        mask = bytearray(len(vals))
+        if op == "in":
+            members = {_conv(m) for m in value}
+            for i, v in enumerate(vals):
+                if v is not None and v in members:
+                    mask[i] = 1
+        elif op == "between":
+            lo, hi = _conv(value[0]), _conv(value[1])
+            for i, v in enumerate(vals):
+                if v is not None and lo <= v <= hi:
+                    mask[i] = 1
+        else:
+            target = _conv(value)
+            fn = _FILTER_OPS[op]
+            for i, v in enumerate(vals):
+                if v is not None and fn(v, target):
+                    mask[i] = 1
+        return mask
+
+    def select_where(self, conditions, columns: Optional[List[str]] = None,
+                     limit: Optional[int] = None, offset: int = 0,
+                     combine: str = "and") -> List[Dict[str, Any]]:
+        """Filter rows with one or more conditions, combined vectorially.
+
+        ``conditions`` is a list of ``(column, op, value)`` triples (op in
+        eq/ne/gt/gte/lt/lte/in/between) or the dict shorthand. Each condition is
+        evaluated column-at-a-time into a bitmask; masks are combined with
+        C-speed big-integer ``AND``/``OR`` (``combine``), so multi-condition
+        ``WHERE`` avoids building a row dict per row. Returns projected rows.
+        """
+        if combine not in ("and", "or"):
+            raise ValueError(f"combine must be 'and' or 'or', got {combine!r}")
+        norm = self._normalize_conditions(conditions)
+        n = self._row_count
+        if n == 0:
+            return []
+
+        if columns is None:
+            col_names = self._col_names
+        else:
+            for c in columns:
+                if c not in self.columns:
+                    raise ValueError(f"Unknown column: {c}")
+            col_names = columns
+
+        materialized: Dict[str, List[Any]] = {}
+
+        # Live rows: exclude deleted rows via the first-column-null heuristic
+        # (matching select()).
+        first_nullmask = self._col_list[0]._nullmask
+        live = bytearray(n)
+        for i in range(n):
+            if not first_nullmask[i]:
+                live[i] = 1
+        live_int = int.from_bytes(live, "little")
+
+        if not norm:
+            final_int = live_int
+        else:
+            masks = [int.from_bytes(self._condition_mask(c, op, v, materialized), "little")
+                     for (c, op, v) in norm]
+            if combine == "or":
+                comb = 0
+                for m in masks:
+                    comb |= m
+            else:
+                comb = masks[0]
+                for m in masks[1:]:
+                    comb &= m
+            final_int = comb & live_int
+
+        if final_int == 0:
+            return []
+        result = final_int.to_bytes(n, "little")
+
+        for c in col_names:
+            if c not in materialized:
+                materialized[c] = self.columns[c].tolist()
+        proj = [(name, materialized[name]) for name in col_names]
+
+        out: List[Dict[str, Any]] = []
+        matched = 0
+        for i in range(n):
+            if result[i]:
+                if matched < offset:
+                    matched += 1
+                    continue
+                out.append({name: vals[i] for name, vals in proj})
+                matched += 1
+                if limit is not None and len(out) >= limit:
+                    break
+        return out
 
     def aggregate(self,
                   column_name: str,

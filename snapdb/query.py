@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import operator
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .core import SnapDB
 

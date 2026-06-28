@@ -15,7 +15,6 @@ import random
 import time
 import tracemalloc
 from pathlib import Path
-import tempfile
 
 from snapdb import SnapDB, Schema, ColumnDef
 

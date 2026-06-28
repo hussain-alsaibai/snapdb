@@ -8,12 +8,8 @@ v0.3.2-OPT: Precompiled struct format eliminates per-column struct.pack/unpack c
 
 import struct
 import time
-import json
-from typing import Any, Dict, List, Tuple, Union
 
 def benchmark():
-    import tempfile
-    import os
     from dataclasses import dataclass, field
 
     # Minimal Schema definition for testing

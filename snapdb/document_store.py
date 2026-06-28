@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional
 
 from .core import SnapDB, Schema, ColumnDef
 
