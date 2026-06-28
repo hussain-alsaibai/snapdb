@@ -290,11 +290,28 @@ class Column:
         self._delta_typecode = new_tc
 
     def _start_for_mode(self) -> None:
-        """Switch to Frame-of-Reference bit-packing mode."""
+        """Switch to Frame-of-Reference bit-packing mode.
+
+        Derive the base (min) and bit-width from the actual data being packed
+        rather than from the sampling stats — the two can differ (e.g. a column
+        that is both delta- and FOR-encoded falls back from delta and then only
+        samples the *post-fallback* values, while ``_data`` still holds the
+        earlier rows). Packing with a too-narrow width would silently corrupt
+        those rows, so if the real range doesn't fit in 16 bits we stay raw.
+        """
+        old_data = list(self._data)
+        if old_data:
+            self._for_min = min(old_data)
+            range_val = max(old_data) - self._for_min
+        else:
+            self._for_min = self._for_stats["min"] if self._for_stats else 0
+            range_val = 0
+        if range_val.bit_length() > 16:
+            # No real space win — keep raw storage.
+            self._for_fallback = True
+            self._for_stats = None
+            return
         self._for_mode = True
-        self._for_min = self._for_stats["min"]
-        max_val = self._for_stats["max"]
-        range_val = max_val - self._for_min
         if range_val <= 0:
             # All values identical - use 1 bit per value (0)
             self._for_bits = 1
@@ -307,7 +324,6 @@ class Column:
         self._for_packed = 0  # Python int bitmask for packed values
         self._for_count = 0
         # Convert existing raw data to FOR packed format
-        old_data = list(self._data)
         self._data = array.array(_array_typecode(self.dtype))
         for v in old_data:
             self._append_for(v)
@@ -540,6 +556,10 @@ class Column:
             elif self._delta_mode and not self._delta_fallback:
                 # Delta values are cumulative — zeroing a delta would shift every
                 # later row. Leave the chain intact; the nullmask hides this row.
+                pass
+            elif self._for_mode and not self._for_fallback:
+                # FOR values are bit-packed and _data is empty; leave the packed
+                # value intact (the nullmask hides this row).
                 pass
             else:
                 self._data[idx] = 0.0 if self._data.typecode in ("f", "d") else 0

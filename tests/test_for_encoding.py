@@ -203,6 +203,34 @@ def test_for_to_numpy_and_buffer():
     print("✅ test_for_to_numpy_and_buffer")
 
 
+def test_for_update_to_none():
+    """update()/__setitem__ setting a FOR value to None must null it, not crash."""
+    t = ColumnarTable("t", [("id", "i64"), ("v", "i64")], for_columns=["v"],
+                      for_threshold=5)
+    for i in range(8):
+        t.insert({"id": i, "v": 1000 + i})
+    assert t.columns["v"]._for_mode
+    t.update(3, {"v": None})            # used to raise IndexError
+    row = t.get(3)
+    assert row is not None and row["v"] is None
+    assert t.get(2)["v"] == 1002 and t.get(4)["v"] == 1004  # neighbors intact
+    print("✅ test_for_update_to_none")
+
+
+def test_for_with_delta_combination_no_corruption():
+    """A column requested as both delta- and FOR-encoded must not corrupt rows
+    when delta falls back and FOR then activates on a subset of samples."""
+    t = ColumnarTable("t", [("x", "i64")], delta_columns=["x"], for_columns=["x"])
+    col = t.columns["x"]
+    vals = [3000] * 49 + [1] + [5000 + (i % 4) for i in range(60)]
+    for v in vals:
+        t.insert({"x": v})
+    assert col.tolist() == vals          # every row reconstructs correctly
+    assert t.aggregate("x", "min") == min(vals)
+    assert t.aggregate("x", "sum") == sum(vals)
+    print("✅ test_for_with_delta_combination_no_corruption")
+
+
 if __name__ == "__main__":
     test_for_threshold_sampling()
     test_for_memory_reduction()
@@ -214,4 +242,6 @@ if __name__ == "__main__":
     test_for_widening_keeps_compression()
     test_for_nulls_after_activation()
     test_for_to_numpy_and_buffer()
+    test_for_update_to_none()
+    test_for_with_delta_combination_no_corruption()
     print("\n✅ All FOR encoding tests passed!")
