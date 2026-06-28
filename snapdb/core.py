@@ -883,11 +883,15 @@ class SnapDB:
             raise RuntimeError("Select requires columnar storage")
         return self._table.select(where=where, columns=columns, limit=limit, offset=offset)
 
-    def aggregate(self, column_name: str, agg: str = "sum", where=None):
-        """Aggregate on a column. Columnar only."""
+    def aggregate(self, column_name: str, agg: str = "sum", where=None, use_numpy=None):
+        """Aggregate on a column. Columnar only.
+
+        When NumPy is installed it is used automatically for plain numeric
+        columns (issue #14); pass use_numpy=False to force the pure-Python path.
+        """
         if not self.is_columnar():
             raise RuntimeError("Aggregate requires columnar storage")
-        return self._table.aggregate(column_name, agg, where)
+        return self._table.aggregate(column_name, agg, where, use_numpy=use_numpy)
 
     def select_column(self, column_name: str) -> List[Any]:
         """Fast extraction of a single column. Columnar only."""

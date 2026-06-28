@@ -8,13 +8,20 @@ v0.4.0: Dictionary encoding for low-cardinality string columns.
 v0.5.0: Delta encoding for monotonic numeric columns.
 v0.6.0: Vectorized filtering, auto-indexing, NumPy export.
 v0.7.0: Frame-of-Reference + bit packing for bounded numeric ranges.
+v0.8.0: Optional NumPy-accelerated aggregates over the zero-copy column buffer.
 """
 
 from __future__ import annotations
 
 import array
+import importlib.util
 import operator
 from typing import Any, Dict, List, Tuple, Callable, Iterator, Optional
+
+# NumPy is an OPTIONAL accelerator (issue #14). We only check availability at
+# import time (no actual import / no hard dependency); the array module path is
+# always the zero-dependency default.
+_HAS_NUMPY = importlib.util.find_spec("numpy") is not None
 
 # Comparison operators for vectorized predicates (issue #4)
 _FILTER_OPS = {
@@ -1058,16 +1065,68 @@ class ColumnarTable:
                     break
         return out
 
+    def _numpy_aggregate(self, col: "Column", agg: str):
+        """NumPy-accelerated aggregate for a plain numeric column, no WHERE.
+
+        Returns ``(handled, value)``. ``handled`` is False when NumPy can't be
+        used while preserving exact parity with the pure-Python path (empty
+        result, or a 64-bit integer sum where a fixed-width accumulator could
+        disagree with Python's arbitrary precision) — the caller then falls
+        back. Reads the column's raw buffer with no copy.
+        """
+        import numpy as np
+        tc = col._data.typecode
+        arr = np.frombuffer(col.buffer(), dtype=_NUMPY_DTYPE[tc])
+        # Detect/filter nulls with NumPy over a zero-copy view of the nullmask —
+        # array.array.count() is ~10x slower and would dominate the runtime.
+        nm_view = np.frombuffer(col._nullmask, dtype=np.int8)
+        if nm_view.any():
+            arr = arr[nm_view == 0]
+        if arr.size == 0:
+            return False, None
+        if tc in ("f", "d") and np.isnan(arr).any():
+            # NumPy min/max propagate NaN while the pure-Python comparison path
+            # skips it — defer to Python so both paths return the same result.
+            return False, None
+        if agg == "min":
+            return True, arr.min().item()
+        if agg == "max":
+            return True, arr.max().item()
+        if agg == "avg":
+            return True, float(arr.mean(dtype=np.float64))
+        if agg == "sum":
+            if tc in ("f", "d"):
+                return True, float(arr.sum(dtype=np.float64))
+            if col.width <= 4:
+                # i8..i32 / u8..u32: a 64-bit accumulator can't overflow for any
+                # realistic row count, so this matches Python's exact sum.
+                acc = np.uint64 if tc in ("B", "H", "I", "Q") else np.int64
+                return True, int(arr.sum(dtype=acc))
+            # i64 / u64: defer to the exact Python sum to avoid overflow drift.
+            return False, None
+        return False, None
+
     def aggregate(self,
                   column_name: str,
                   agg: str = "sum",
-                  where: Optional[Callable[[Dict[str, Any]], bool]] = None) -> Any:
+                  where: Optional[Callable[[Dict[str, Any]], bool]] = None,
+                  use_numpy: Optional[bool] = None) -> Any:
         if column_name not in self.columns:
             raise ValueError(f"Unknown column: {column_name}")
         col = self.columns[column_name]
 
         if agg == "count":
             return col.count_valid()
+
+        # NumPy-accelerated path (issue #14): plain numeric column, no WHERE.
+        # Auto-enabled when NumPy is installed; pass use_numpy=False to force the
+        # pure-Python path. Falls through when NumPy can't preserve exact parity.
+        want_numpy = _HAS_NUMPY and (use_numpy is None or use_numpy)
+        if (where is None and want_numpy and col._is_plain_numeric()
+                and len(col._data) > 0):
+            handled, value = self._numpy_aggregate(col, agg)
+            if handled:
+                return value
 
         # Vectorized path: plain (array-backed) numeric column with no nulls and
         # no where clause. sum()/min()/max() over an array.array run in C, far
