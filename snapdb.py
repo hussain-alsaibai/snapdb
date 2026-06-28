@@ -120,6 +120,29 @@ class Schema:
         self._offsets = [0]
         for c in columns[:-1]:
             self._offsets.append(self._offsets[-1] + c.width)
+        # Precompile struct format for fast encode/decode
+        self._compile_format()
+
+    def _compile_format(self) -> None:
+        """Precompute struct format string for batch pack/unpack."""
+        codes = []
+        for col in self.columns:
+            if col.dtype == "bool":
+                codes.append("?")
+            elif col.dtype.startswith("bytes"):
+                codes.append(f"{col.width}s")
+            else:
+                codes.append(_struct_code(col.dtype))
+        self._struct_fmt = "<" + "".join(codes)
+        self._struct_size = struct.calcsize(self._struct_fmt)
+
+    @property
+    def struct_fmt(self) -> str:
+        return self._struct_fmt
+
+    @property
+    def struct_size(self) -> int:
+        return self._struct_size
 
     @property
     def row_width(self) -> int:
@@ -143,29 +166,31 @@ class Schema:
         return [(c.name, c.dtype) for c in self.columns]
 
     def encode_row(self, row: Dict[str, Any]) -> bytes:
-        parts = []
+        # Use precompiled struct format for speed
+        values = []
         for col in self.columns:
             val = row.get(col.name, 0)
             if col.dtype == "bool":
-                parts.append(struct.pack("?", bool(val)))
+                values.append(bool(val))
             elif col.dtype.startswith("bytes"):
                 raw = val if isinstance(val, bytes) else str(val).encode("utf-8")
-                parts.append(struct.pack(f"{col.width}s", raw[:col.width].ljust(col.width, b"\x00")))
+                values.append(raw[:col.width].ljust(col.width, b"\x00"))
             else:
-                parts.append(struct.pack(f"<{_struct_code(col.dtype)}", val))
-        return b"".join(parts)
+                values.append(val)
+        return struct.pack(self._struct_fmt, *values)
 
     def decode_row(self, buf: Union[bytes, memoryview]) -> Dict[str, Any]:
+        # Use precompiled struct format for speed
+        raw = bytes(buf) if isinstance(buf, memoryview) else buf
+        unpacked = struct.unpack(self._struct_fmt, raw)
         row: Dict[str, Any] = {}
-        for col in self.columns:
-            off = self.offset(col.name)
-            raw = bytes(buf[off : off + col.width])
+        for col, val in zip(self.columns, unpacked):
             if col.dtype == "bool":
-                row[col.name] = struct.unpack("?", raw)[0]
+                row[col.name] = val
             elif col.dtype.startswith("bytes"):
-                row[col.name] = raw.rstrip(b"\x00").decode("utf-8", errors="replace")
+                row[col.name] = val.rstrip(b"\x00").decode("utf-8", errors="replace")
             else:
-                row[col.name] = struct.unpack(f"<{_struct_code(col.dtype)}", raw)[0]
+                row[col.name] = val
         return row
 
 
@@ -491,6 +516,9 @@ class SnapDB:
             if self.is_columnar():
                 idx = self._table.insert(row)
                 self._cdc_log("insert", idx, row)
+                # Update index if exists
+                if hasattr(self._table, '_indexes'):
+                    self._update_index(idx, row)
                 return idx
             for slab_idx, slab in enumerate(self._slabs):
                 if not slab.is_full:
@@ -498,12 +526,16 @@ class SnapDB:
                     global_idx = slab_idx * self._rows_per_slab + local_idx
                     self._total_rows += 1
                     self._cdc_log("insert", global_idx, row)
+                    if hasattr(self, '_idx_cache'):
+                        self._update_index(global_idx, row)
                     return global_idx
             self._expand()
             idx = self._slabs[-1].insert(row)
             global_idx = (len(self._slabs) - 1) * self._rows_per_slab + idx
             self._total_rows += 1
             self._cdc_log("insert", global_idx, row)
+            if hasattr(self, '_idx_cache'):
+                self._update_index(global_idx, row)
             return global_idx
 
     def batch_insert(self, rows: List[Dict[str, Any]]) -> int:
@@ -557,12 +589,96 @@ class SnapDB:
                 return None
             return self._slabs[slab_idx].get_raw(local_idx)
 
+    # ── Hash Index (in-memory, optional) ─────────────────────────────────────
+
+    def create_index(self, column_name: str) -> None:
+        """Create an in-memory hash index on a column for fast lookups."""
+        if self.is_columnar():
+            if not hasattr(self._table, '_indexes'):
+                self._table._indexes = {}
+            self._table._indexes[column_name] = {}
+            for i in range(self._table._row_count):
+                col = self._table.columns[column_name]
+                if col._nullmask[i] == 0:
+                    val = col[i]
+                    self._table._indexes[column_name][val] = i
+            return
+
+        if not hasattr(self, '_idx_cache'):
+            self._idx_cache: Dict[str, Dict[Any, int]] = {}
+        self._idx_cache[column_name] = {}
+        for slab_idx, slab in enumerate(self._slabs):
+            for local_idx in range(slab.count):
+                if not slab._live[local_idx]:
+                    continue
+                start = slab._row_offset(local_idx)
+                end = start + self.schema.row_width
+                row = self.schema.decode_row(memoryview(slab._mm)[start:end])
+                val = row.get(column_name)
+                if val is not None:
+                    global_idx = slab_idx * self._rows_per_slab + local_idx
+                    self._idx_cache[column_name][val] = global_idx
+
+    def lookup(self, column_name: str, value: Any) -> Optional[Dict[str, Any]]:
+        """Fast lookup by indexed column — requires create_index() first."""
+        if self.is_columnar():
+            if hasattr(self._table, '_indexes') and column_name in self._table._indexes:
+                idx = self._table._indexes[column_name].get(value)
+                if idx is not None:
+                    return self._table.get(idx)
+            for i in range(self._table._row_count):
+                col = self._table.columns[column_name]
+                if col._nullmask[i] == 0 and col[i] == value:
+                    return self._table.get(i)
+            return None
+
+        if hasattr(self, '_idx_cache') and column_name in self._idx_cache:
+            idx = self._idx_cache[column_name].get(value)
+            if idx is not None:
+                return self.get(idx)
+        for slab_idx, slab in enumerate(self._slabs):
+            for local_idx in range(slab.count):
+                if not slab._live[local_idx]:
+                    continue
+                start = slab._row_offset(local_idx)
+                end = start + self.schema.row_width
+                row = self.schema.decode_row(memoryview(slab._mm)[start:end])
+                if row.get(column_name) == value:
+                    return row
+        return None
+
+    def _update_index(self, idx: int, row: Dict[str, Any]) -> None:
+        """Update index entries after insert/update/delete."""
+        if self.is_columnar():
+            if hasattr(self._table, '_indexes'):
+                for col_name, idx_map in self._table._indexes.items():
+                    if col_name in row:
+                        val = row[col_name]
+                        for k, v in list(idx_map.items()):
+                            if v == idx:
+                                del idx_map[k]
+                                break
+                        idx_map[val] = idx
+            return
+
+        if hasattr(self, '_idx_cache'):
+            for col_name, idx_map in self._idx_cache.items():
+                if col_name in row:
+                    val = row[col_name]
+                    for k, v in list(idx_map.items()):
+                        if v == idx:
+                            del idx_map[k]
+                            break
+                    idx_map[val] = idx
+
     def update(self, idx: int, row: Dict[str, Any]) -> None:
         with self._m_time("update"):
             if self.is_columnar():
                 old = self._table.get(idx)
                 self._table.update(idx, row)
                 self._cdc_log("update", idx, row, old)
+                if hasattr(self, '_idx_cache'):
+                    self._update_index(idx, row)
                 return
             slab_idx = idx // self._rows_per_slab
             local_idx = idx % self._rows_per_slab
@@ -571,6 +687,8 @@ class SnapDB:
             old_row = self._slabs[slab_idx].get(local_idx)
             self._slabs[slab_idx].update(local_idx, row)
             self._cdc_log("update", idx, row, old_row)
+            if hasattr(self, '_idx_cache'):
+                self._update_index(idx, row)
 
     def delete(self, idx: int) -> None:
         with self._m_time("delete"):
@@ -578,6 +696,12 @@ class SnapDB:
                 old = self._table.get(idx)
                 self._table.delete(idx)
                 self._cdc_log("delete", idx, None, old)
+                if hasattr(self._table, '_indexes'):
+                    for idx_map in self._table._indexes.values():
+                        for k, v in list(idx_map.items()):
+                            if v == idx:
+                                del idx_map[k]
+                                break
                 return
             slab_idx = idx // self._rows_per_slab
             local_idx = idx % self._rows_per_slab
@@ -587,6 +711,12 @@ class SnapDB:
             self._slabs[slab_idx].delete(local_idx)
             self._total_rows -= 1
             self._cdc_log("delete", idx, None, old_row)
+            if hasattr(self, '_idx_cache'):
+                for idx_map in self._idx_cache.values():
+                    for k, v in list(idx_map.items()):
+                        if v == idx:
+                            del idx_map[k]
+                            break
 
     def query(self, predicate: Callable[[Dict[str, Any]], bool]) -> Iterator[Tuple[int, Dict[str, Any]]]:
         with self._m_time("query"):
