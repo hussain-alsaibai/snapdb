@@ -312,6 +312,15 @@ on Linux (3.9–3.13) and Windows, and the benchmark on every push and PR.
 - **v0.2.0** — Query engine, hash indexes, WAL transactions, DocumentStore
 - **v0.1.0** — Initial release
 
+## Roadmap & Known Limitations
+
+Tracked as GitHub issues:
+
+- [#11](https://github.com/hussain-alsaibai/snapdb/issues/11) — Frame-of-Reference (FOR) encoding for bounded numeric ranges
+- [#12](https://github.com/hussain-alsaibai/snapdb/issues/12) — Low-overhead query profiler via `sys.monitoring` (PEP 669)
+- [#13](https://github.com/hussain-alsaibai/snapdb/issues/13) — **Known limitation:** row-store bulk insert is slow (per-page mmap remap on expand); use columnar storage for bulk/analytical loads
+- [#14](https://github.com/hussain-alsaibai/snapdb/issues/14) — Optional NumPy-accelerated filters & aggregates (keeping the zero-dependency default)
+
 ## License
 
 MIT — see [LICENSE](LICENSE)
