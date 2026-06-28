@@ -10,8 +10,10 @@ Compares SnapDB against other Python in-memory data stores:
 Metrics: Insert/sec, Read/sec, Scan/sec, Memory
 """
 
+import os
 import sqlite3
 import random
+import tempfile
 import time
 import tracemalloc
 from pathlib import Path
@@ -20,6 +22,8 @@ from snapdb import SnapDB, Schema, ColumnDef
 
 N = 100_000
 READ_OPS = 50_000
+# Cross-platform temp path (was a hardcoded /tmp path that broke on Windows).
+_BENCH_PATH = os.path.join(tempfile.gettempdir(), "snapdb_bench.snap")
 
 
 def measure_mem(label, fn, *args):
@@ -39,7 +43,7 @@ def snapdb_insert():
         ColumnDef("temp", "f32"),
         ColumnDef("active", "bool"),
     ])
-    db = SnapDB("/tmp/snapdb_bench.snap", schema)
+    db = SnapDB(_BENCH_PATH, schema)
     start = time.perf_counter()
     for i in range(N):
         db.insert({"id": i, "temp": 20.0 + (i % 30), "active": i % 7 == 0})
@@ -130,7 +134,7 @@ def main():
 
     _, peak = measure_mem("snapdb", lambda: None)
     # Measure file size
-    file_size = Path("/tmp/snapdb_bench.snap").stat().st_size
+    file_size = Path(_BENCH_PATH).stat().st_size
     print(f"  File size: {file_size / 1024:.1f} KB")
 
     elapsed = snapdb_read(db)
