@@ -83,6 +83,24 @@ class TestNumpyAggregateParity(unittest.TestCase):
         self.assertTrue(tf.columns["v"]._for_mode)
         self.assertEqual(tf.aggregate("v", "sum"), sum(1000 + (i % 50) for i in range(200)))
 
+    def test_nan_parity(self):
+        # A float column containing NaN must give identical results from both
+        # paths (NumPy defers to Python so min/max don't diverge on NaN).
+        import math
+        for dtype in ("f32", "f64"):
+            t = ColumnarTable("t", [("x", dtype)])
+            t.batch_insert([{"x": v} for v in (1.0, float("nan"), 3.0, 2.0)])
+            for agg in ("min", "max", "sum", "avg"):
+                a = t.aggregate("x", agg, use_numpy=True)
+                b = t.aggregate("x", agg, use_numpy=False)
+                if isinstance(a, float) and math.isnan(a):
+                    self.assertTrue(math.isnan(b), f"{dtype} {agg}")
+                else:
+                    self.assertEqual(a, b, f"{dtype} {agg}: {a} != {b}")
+            # non-leading NaN: min/max skip it identically in both paths
+            self.assertEqual(t.aggregate("x", "min", use_numpy=True), 1.0)
+            self.assertEqual(t.aggregate("x", "max", use_numpy=True), 3.0)
+
     def test_i64_sum_exact(self):
         # large i64 values: NumPy path defers to exact Python sum; verify exactness
         t = ColumnarTable("t", [("x", "i64")])

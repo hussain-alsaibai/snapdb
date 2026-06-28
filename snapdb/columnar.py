@@ -1084,6 +1084,10 @@ class ColumnarTable:
             arr = arr[nm_view == 0]
         if arr.size == 0:
             return False, None
+        if tc in ("f", "d") and np.isnan(arr).any():
+            # NumPy min/max propagate NaN while the pure-Python comparison path
+            # skips it — defer to Python so both paths return the same result.
+            return False, None
         if agg == "min":
             return True, arr.min().item()
         if agg == "max":
