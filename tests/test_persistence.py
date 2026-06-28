@@ -100,6 +100,31 @@ class TestPersistence(unittest.TestCase):
         finally:
             db.close()
 
+    def test_batch_insert_multi_slab_reopen(self):
+        # batch_insert grows the file in one shot across many slabs; the result
+        # must persist and stay consistent with single inserts.
+        db = self._open()
+        db.insert({"id": 0, "name": b"first", "score": -1.0})           # single
+        db.batch_insert([{"id": i, "name": f"u{i}".encode(), "score": float(i)}
+                         for i in range(1, 1000)])                       # spans slabs
+        db.insert({"id": 1000, "name": b"last", "score": 1.0})          # single after batch
+        self.assertGreater(len(db._slabs), 1)
+        self.assertEqual(len(db), 1001)
+        db.close()
+
+        db = self._open()
+        try:
+            self.assertEqual(len(db), 1001)
+            self.assertEqual(db.get(0)["name"], "first")
+            self.assertEqual(db.get(500)["id"], 500)
+            self.assertEqual(db.get(1000)["name"], "last")
+            # appends after reopen land at the right high-water
+            idx = db.insert({"id": 2000, "name": b"new", "score": 2.0})
+            self.assertEqual(idx, 1001)
+            self.assertEqual(db.get(1001)["id"], 2000)
+        finally:
+            db.close()
+
     def test_double_reopen_roundtrip(self):
         db = self._open()
         for i in range(300):

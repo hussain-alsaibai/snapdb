@@ -275,7 +275,7 @@ _100,000 rows · 50,000 point reads · best of 5 · Python 3.13 · win32 (NumPy 
 
 | Workload | Unit | SnapDB (columnar) | SnapDB (row) | sqlite3 (:memory:) | pandas | dict (baseline) |
 |---|---|---|---|---|---|---|
-| Bulk insert | rows/s | 467,309 | 11,173 | 770,788 | 794,461 | 11,139,083 |
+| Bulk insert | rows/s | 467,309 | 287,230 | 770,788 | 794,461 | 11,139,083 |
 | Point read (PK) | ops/s | 86,243 | 87,836 | 370,698 | 32,296 | 5,494,807 |
 | Full scan + SUM | rows/s | 529,660,985 | 483,067 | 19,910,403 | 513,874,544 | 19,488,619 |
 | 3-cond filter | rows/s | 2,259,928 | 470,223 | 11,842,168 | 19,827,894 | 13,811,773 |
@@ -356,6 +356,8 @@ on Linux (3.9–3.13) and Windows, and the benchmark on every push and PR.
 
 ## Version History
 
+- **v0.10.0** — Fast row-store bulk insert ([#13](https://github.com/hussain-alsaibai/snapdb/issues/13)):
+  - `batch_insert()` now grows the backing file in a **single** truncate + remap for the whole batch instead of one per slab — **~26× faster** (100K rows: ~5.8s → ~0.29s, now in the same ballpark as SQLite/pandas). On-disk format and durability guarantees unchanged
 - **v0.9.0** — NumPy-accelerated filters ([#14](https://github.com/hussain-alsaibai/snapdb/issues/14)):
   - `select_where()` builds condition masks vectorially over the column buffers when NumPy is installed (~2× faster); `use_numpy=False` forces the pure-Python path
   - New `count_where()` — filtered row count with no materialization, **~314M rows/s** on numeric predicates (~166×). Exact parity with the pure-Python path verified
@@ -393,7 +395,6 @@ Tracked as GitHub issues:
 
 - [#11](https://github.com/hussain-alsaibai/snapdb/issues/11) — Frame-of-Reference (FOR) encoding for bounded numeric ranges
 - [#12](https://github.com/hussain-alsaibai/snapdb/issues/12) — Low-overhead query profiler via `sys.monitoring` (PEP 669)
-- [#13](https://github.com/hussain-alsaibai/snapdb/issues/13) — **Known limitation:** row-store bulk insert is slow (per-page mmap remap on expand); use columnar storage for bulk/analytical loads
 - [#14](https://github.com/hussain-alsaibai/snapdb/issues/14) — Optional NumPy-accelerated filters & aggregates (keeping the zero-dependency default)
 
 ## License
