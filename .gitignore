@@ -1,8 +1,44 @@
-__pycache__/
-*.pyc
+# SnapDB data / artifacts
 *.snap
 *.wal
 *.cdc
 *.bak
 *.backup
+
+# Secrets / local tooling — never commit
 github.token
+.claude/
+.env
+.env.*
+
+# Generated benchmark output
+bench.json
+bench.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
