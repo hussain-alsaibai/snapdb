@@ -76,7 +76,18 @@ class Column:
 
     v0.4.0: Dictionary encoding for low-cardinality string columns.
     v0.5.0: Delta encoding for monotonic numeric columns.
+    v0.6.0: O(1) delta reads via a lazily-built reconstruction cache;
+            __slots__ for lower per-column memory overhead.
     """
+
+    __slots__ = (
+        "name", "dtype", "width",
+        "_dict_encode", "_dict_threshold", "_dict_mode", "_dict_fallback",
+        "_dict", "_dict_values", "_dict_codes",
+        "_delta_encode", "_delta_samples", "_delta_mode", "_delta_fallback",
+        "_delta_base", "_delta_prev", "_deltas", "_delta_typecode", "_delta_cache",
+        "_data", "_nullmask",
+    )
 
     def __init__(self, name: str, dtype: str,
                  dict_encode: bool = False, dict_threshold: int = 256,
@@ -101,6 +112,10 @@ class Column:
         self._delta_prev: int = 0              # previous value for delta computation
         self._deltas: Optional[array.array] = None  # delta per row
         self._delta_typecode: Optional[str] = None
+        # Lazily-built full reconstruction of a delta column. Built on first
+        # read after a write so random access / scans are O(1) / O(n) instead
+        # of O(n) / O(n^2). Invalidated (set to None) whenever deltas change.
+        self._delta_cache: Optional[array.array] = None
         self._data: Any = None
         self._nullmask: Optional[array.array] = None
         self._init_storage()
@@ -147,21 +162,34 @@ class Column:
         self._dict_values = []
         self._dict_codes = None
 
+    def _reconstruct_delta(self) -> array.array:
+        """Rebuild the full value array from base + deltas (O(n), one pass)."""
+        out = array.array(_array_typecode(self.dtype))
+        val = self._delta_base
+        out.append(val)  # row 0 == base
+        for d in self._deltas:
+            val += d
+            out.append(val)
+        return out
+
+    def _ensure_delta_cache(self) -> array.array:
+        """Return a cached full reconstruction, building it once if needed."""
+        cache = self._delta_cache
+        if cache is None:
+            cache = self._reconstruct_delta()
+            self._delta_cache = cache
+        return cache
+
     def _convert_delta_to_raw(self) -> None:
         """Convert from delta mode back to raw storage (non-monotonic detected)."""
         if not self._delta_mode or self._delta_fallback:
             return
         self._delta_fallback = True
         # Reconstruct full values from base + deltas
-        raw = array.array(_array_typecode(self.dtype))
-        val = self._delta_base
-        raw.append(val)
-        for i in range(1, len(self._deltas)):
-            val += self._deltas[i]
-            raw.append(val)
-        self._data = raw
+        self._data = self._reconstruct_delta()
         self._delta_mode = False
         self._deltas = None
+        self._delta_cache = None
         self._delta_base = 0
         self._delta_prev = 0
         self._delta_typecode = None
@@ -225,6 +253,7 @@ class Column:
 
     def _append_delta(self, value: int) -> None:
         """Append value using delta encoding."""
+        self._delta_cache = None  # invalidate reconstruction cache
         delta = value - self._delta_prev
         self._delta_prev = value
 
@@ -263,6 +292,7 @@ class Column:
                 pass
             elif self._delta_mode and not self._delta_fallback:
                 self._deltas.append(0)
+                self._delta_cache = None  # invalidate reconstruction cache
             else:
                 self._data.append(0 if self._data.typecode not in ("f", "d") else 0.0)
         else:
@@ -309,6 +339,7 @@ class Column:
                                 self._deltas.append(delta)
                                 prev = old_data[i]
                             self._delta_prev = prev
+                            self._delta_cache = None  # invalidate reconstruction cache
                         else:
                             self._delta_fallback = True
                 else:
@@ -318,13 +349,12 @@ class Column:
                 self._data.append(value)
 
     def _get_delta_value(self, idx: int) -> int:
-        """Reconstruct value from delta encoding at index."""
-        if idx == 0:
-            return self._delta_base
-        val = self._delta_base
-        for i in range(idx):
-            val += self._deltas[i]
-        return val
+        """Reconstruct value from delta encoding at index (O(1) amortized).
+
+        Uses a cached full reconstruction so repeated point/scan access does
+        not re-sum the delta prefix on every call (previously O(n) per read).
+        """
+        return self._ensure_delta_cache()[idx]
 
     def __getitem__(self, idx: int) -> Any:
         if self._nullmask[idx]:
@@ -354,7 +384,9 @@ class Column:
                 # Clear the bit
                 self._data &= ~(1 << idx)
             elif self._delta_mode and not self._delta_fallback:
-                self._deltas[idx] = 0
+                # Delta values are cumulative — zeroing a delta would shift every
+                # later row. Leave the chain intact; the nullmask hides this row.
+                pass
             else:
                 self._data[idx] = 0.0 if self._data.typecode in ("f", "d") else 0
         else:
@@ -395,6 +427,9 @@ class Column:
         is_bool = self.dtype == "bool"
         is_dict = self._dict_mode and not self._dict_fallback
         is_delta = self._delta_mode and not self._delta_fallback
+        if is_delta:
+            # Reconstruct once (O(n)); previously this re-summed per element (O(n^2)).
+            data = self._ensure_delta_cache()
         for i in range(len(nullmask)):
             if nullmask[i] == 0:
                 if is_dict:
@@ -403,10 +438,35 @@ class Column:
                     yield i, data[i].decode("utf-8", errors="replace")
                 elif is_bool:
                     yield i, bool((data >> i) & 1)
-                elif is_delta:
-                    yield i, self._get_delta_value(i)
                 else:
                     yield i, data[i]
+
+    def tolist(self) -> List[Any]:
+        """Materialize the whole column to a Python list (None for nulls).
+
+        Single O(n) pass that avoids per-element __getitem__ dispatch — used by
+        column scans (select / select_column) for a large constant-factor win.
+        """
+        nullmask = self._nullmask
+        n = len(nullmask)
+        if self.dtype == "bool":
+            data = self._data
+            return [None if nullmask[i] else bool((data >> i) & 1) for i in range(n)]
+        if self.dtype.startswith("bytes"):
+            if self._dict_mode and not self._dict_fallback:
+                values, codes = self._dict_values, self._dict_codes
+                return [None if nullmask[i]
+                        else values[codes[i]].decode("utf-8", errors="replace")
+                        for i in range(n)]
+            data = self._data
+            return [None if nullmask[i]
+                    else data[i].decode("utf-8", errors="replace")
+                    for i in range(n)]
+        if self._delta_mode and not self._delta_fallback:
+            data = self._ensure_delta_cache()
+        else:
+            data = self._data
+        return [None if nullmask[i] else data[i] for i in range(n)]
 
     def count_valid(self) -> int:
         return self._nullmask.count(0)
@@ -537,7 +597,9 @@ class ColumnarTable:
                 else:
                     col._data[idx] = b""
             elif col._delta_mode and not col._delta_fallback:
-                col._deltas[idx] = 0
+                # Delta values are cumulative — mutating a delta would corrupt
+                # every later row. The nullmask alone marks the row deleted.
+                pass
             elif hasattr(col._data, 'typecode') and col._data.typecode in ("f", "d"):
                 col._data[idx] = 0.0
             else:
@@ -559,18 +621,25 @@ class ColumnarTable:
         result: List[Dict[str, Any]] = []
         matched = 0
 
-        # Pre-fetch column references for speed
-        selected_cols = [self.columns[name] for name in col_names]
         all_cols = self._col_list
+        first_nullmask = all_cols[0]._nullmask
+
+        # Materialize the needed columns up front. This avoids per-cell
+        # __getitem__ dispatch and, crucially, keeps delta columns O(n) instead
+        # of O(n^2). When a predicate is present it sees every column, so all
+        # columns are materialized; otherwise only the projected ones are.
+        if where is not None:
+            mat = {col.name: col.tolist() for col in all_cols}
+        else:
+            mat = {name: self.columns[name].tolist() for name in col_names}
 
         for idx in range(self._row_count):
             # Quick null check: skip if first col is null (likely deleted)
-            if all_cols[0]._nullmask[idx]:
+            if first_nullmask[idx]:
                 continue
 
             if where is not None:
-                # Build row dict for predicate
-                row = {col.name: col[idx] for col in all_cols}
+                row = {name: mat[name][idx] for name in self._col_names}
                 if not where(row):
                     continue
 
@@ -578,8 +647,7 @@ class ColumnarTable:
                 matched += 1
                 continue
 
-            # Build projected row
-            result.append({name: col[idx] for name, col in zip(col_names, selected_cols)})
+            result.append({name: mat[name][idx] for name in col_names})
             matched += 1
             if limit is not None and len(result) >= limit:
                 break
@@ -588,8 +656,8 @@ class ColumnarTable:
     def select_column(self, column_name: str) -> List[Any]:
         if column_name not in self.columns:
             raise ValueError(f"Unknown column: {column_name}")
-        col = self.columns[column_name]
-        return [col[i] for i in range(len(col))]
+        # tolist() is a single O(n) pass (and O(n) — not O(n^2) — for delta cols).
+        return self.columns[column_name].tolist()
 
     def aggregate(self,
                   column_name: str,
@@ -601,6 +669,26 @@ class ColumnarTable:
 
         if agg == "count":
             return col.count_valid()
+
+        # Vectorized path: plain (array-backed) numeric column with no nulls and
+        # no where clause. sum()/min()/max() over an array.array run in C, far
+        # faster than a Python per-element loop.
+        if where is None:
+            is_plain = (
+                not col.dtype.startswith("bytes")
+                and col.dtype != "bool"
+                and not (col._delta_mode and not col._delta_fallback)
+            )
+            if is_plain and len(col._data) > 0 and col._nullmask.count(1) == 0:
+                data = col._data
+                if agg == "sum":
+                    return sum(data)
+                if agg == "avg":
+                    return sum(data) / len(data)
+                if agg == "min":
+                    return min(data)
+                if agg == "max":
+                    return max(data)
 
         # Fast path: no where clause — iterate column directly
         if where is None:
@@ -629,49 +717,45 @@ class ColumnarTable:
                         max_val = v
                 return max_val
 
-        # Slow path: with where clause
+        # Slow path: with where clause. Materialize columns once (keeps delta
+        # columns O(n), avoids per-cell dispatch) and read the aggregate value
+        # via the materialized list — col._data[idx] is wrong for encoded
+        # columns (e.g. delta mode stores deltas, not values).
         all_cols = self._col_list
-        if agg == "sum":
-            total = 0
+        col_names = self._col_names
+        mat = {c.name: c.tolist() for c in all_cols}
+        target = mat[column_name]
+        first_nullmask = all_cols[0]._nullmask
+        col_nullmask = col._nullmask
+
+        def _matching_values():
             for idx in range(self._row_count):
-                if all_cols[0]._nullmask[idx]:
+                if first_nullmask[idx] or col_nullmask[idx]:
                     continue
-                row = {c.name: c[idx] for c in all_cols}
-                if where(row) and col._nullmask[idx] == 0:
-                    total += col._data[idx]
-            return total
+                row = {name: mat[name][idx] for name in col_names}
+                if where(row):
+                    yield target[idx]
+
+        if agg == "sum":
+            return sum(_matching_values())
         if agg == "avg":
             total = 0
             count = 0
-            for idx in range(self._row_count):
-                if all_cols[0]._nullmask[idx]:
-                    continue
-                row = {c.name: c[idx] for c in all_cols}
-                if where(row) and col._nullmask[idx] == 0:
-                    total += col._data[idx]
-                    count += 1
+            for v in _matching_values():
+                total += v
+                count += 1
             return total / count if count else 0
         if agg == "min":
             min_val = None
-            for idx in range(self._row_count):
-                if all_cols[0]._nullmask[idx]:
-                    continue
-                row = {c.name: c[idx] for c in all_cols}
-                if where(row) and col._nullmask[idx] == 0:
-                    v = col._data[idx]
-                    if min_val is None or v < min_val:
-                        min_val = v
+            for v in _matching_values():
+                if min_val is None or v < min_val:
+                    min_val = v
             return min_val
         if agg == "max":
             max_val = None
-            for idx in range(self._row_count):
-                if all_cols[0]._nullmask[idx]:
-                    continue
-                row = {c.name: c[idx] for c in all_cols}
-                if where(row) and col._nullmask[idx] == 0:
-                    v = col._data[idx]
-                    if max_val is None or v > max_val:
-                        max_val = v
+            for v in _matching_values():
+                if max_val is None or v > max_val:
+                    max_val = v
             return max_val
 
         raise ValueError(f"Unsupported aggregation: {agg}")

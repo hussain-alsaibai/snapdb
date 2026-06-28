@@ -5,3 +5,4 @@ __pycache__/
 *.cdc
 *.bak
 *.backup
+github.token

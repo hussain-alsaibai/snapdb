@@ -198,6 +198,13 @@ python -m tests.test_document_store
 
 ## Version History
 
+- **v0.6.0** — Performance & correctness pass:
+  - Delta-encoded column reads are now **O(1)/O(n)** (lazy reconstruction cache) instead of **O(n)/O(n²)** — multi-order-of-magnitude faster delta scans/aggregates
+  - Hash indexes are now genuinely **kept in sync** on insert / `batch_insert` / update / delete (previously went stale after the first build); single unified `create_index()` for row **and** columnar storage
+  - Fixed data corruption: deleting/nulling a delta-encoded row no longer shifts other rows' values
+  - Transaction rollback now actually undoes writes (and restores indexes)
+  - Vectorized aggregates (array-level `sum`/`min`/`max`) for null-free numeric columns
+  - `__slots__` on hot classes; `close()` reliably releases the mmap (Windows file locks)
 - **v0.5.0** — Delta encoding (1.2× memory reduction for monotonic numeric columns)
 - **v0.4.0** — Dictionary encoding (3× memory reduction for low-cardinality strings)
 - **v0.3.2** — Precompiled struct format, hash index, bit-packed booleans
