@@ -13,7 +13,6 @@ v0.7.0: Frame-of-Reference + bit packing for bounded numeric ranges.
 from __future__ import annotations
 
 import array
-import math
 import operator
 from typing import Any, Dict, List, Tuple, Callable, Iterator, Optional
 
