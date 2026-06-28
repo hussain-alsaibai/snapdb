@@ -56,7 +56,13 @@ class Column:
         self._init_storage()
 
     def _init_storage(self) -> None:
-        if self.dtype.startswith("bytes"):
+        if self.dtype == "bool":
+            # Bit-packed boolean storage: Python int bitmask
+            # _data is an int where bit i = value of row i (1=True, 0=False)
+            self._data = 0
+            self._bool_count = 0
+            self._nullmask = array.array("b")
+        elif self.dtype.startswith("bytes"):
             self._data: List[bytes] = []
             self._nullmask = array.array("b")
         else:
@@ -69,6 +75,9 @@ class Column:
             self._nullmask.append(1)
             if self.dtype.startswith("bytes"):
                 self._data.append(b"")
+            elif self.dtype == "bool":
+                # For bool bitmask, nulls just need nullmask entry
+                pass
             else:
                 self._data.append(0 if self._data.typecode not in ("f", "d") else 0.0)
         else:
@@ -78,7 +87,9 @@ class Column:
                     value = value.encode("utf-8")
                 self._data.append(bytes(value))
             elif self.dtype == "bool":
-                self._data.append(1 if value else 0)
+                bit_pos = len(self._nullmask) - 1
+                if value:
+                    self._data |= (1 << bit_pos)
             else:
                 self._data.append(value)
 
@@ -88,7 +99,7 @@ class Column:
         if self.dtype.startswith("bytes"):
             return self._data[idx].decode("utf-8", errors="replace")
         if self.dtype == "bool":
-            return bool(self._data[idx])
+            return bool((self._data >> idx) & 1)
         return self._data[idx]
 
     def __setitem__(self, idx: int, value: Any) -> None:
@@ -107,7 +118,10 @@ class Column:
                     value = value.encode("utf-8")
                 self._data[idx] = bytes(value)
             elif self.dtype == "bool":
-                self._data[idx] = 1 if value else 0
+                if value:
+                    self._data |= (1 << idx)
+                else:
+                    self._data &= ~(1 << idx)
             else:
                 self._data[idx] = value
 
@@ -125,7 +139,7 @@ class Column:
                 if is_bytes:
                     yield i, data[i].decode("utf-8", errors="replace")
                 elif is_bool:
-                    yield i, bool(data[i])
+                    yield i, bool((data >> i) & 1)
                 else:
                     yield i, data[i]
 
@@ -136,6 +150,9 @@ class Column:
         if self.dtype.startswith("bytes"):
             total = sum(len(d) for d in self._data)
             return total + len(self._nullmask) + len(self._data) * 8
+        elif self.dtype == "bool":
+            # Python int bitmask: ~1 bit per value
+            return (self._data.bit_length() + 7) // 8 + len(self._nullmask)
         else:
             return len(self._data) * self._data.itemsize + len(self._nullmask)
 
@@ -208,9 +225,12 @@ class ColumnarTable:
             raise IndexError(f"Row index {idx} out of range")
         for col in self._col_list:
             col._nullmask[idx] = 1
-            if col.dtype.startswith("bytes"):
+            if col.dtype == "bool":
+                # Clear the bit at idx in the bitmask
+                col._data &= ~(1 << idx)
+            elif col.dtype.startswith("bytes"):
                 col._data[idx] = b""
-            elif col._data.typecode in ("f", "d"):
+            elif hasattr(col._data, 'typecode') and col._data.typecode in ("f", "d"):
                 col._data[idx] = 0.0
             else:
                 col._data[idx] = 0

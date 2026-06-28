@@ -24,7 +24,7 @@ import tempfile
 import tracemalloc
 from typing import Any, Dict, List, Tuple, Callable
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from snapdb import SnapDB, Schema, ColumnDef
 from columnar import ColumnarTable
 

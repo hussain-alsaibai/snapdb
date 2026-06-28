@@ -8,11 +8,9 @@ import os
 import time
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from snapdb import SnapDB, Schema, ColumnDef
-from metrics import Metrics
-from columnar import ColumnarTable
+from snapdb import SnapDB, Schema, ColumnDef, Metrics, ColumnarTable
 
 PASS = 0
 FAIL = 0

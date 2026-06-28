@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snapdb"
+version = "0.3.2"
+description = "Extremely Lightweight Lightning-Fast In-Memory Database for Python"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "H. A. Alsaibai", email = "hussain.alsaibai@gmail.com"},
+]
+keywords = ["database", "in-memory", "embedded", "columnar", "mmap", "zero-copy", "pure-python"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.9"
+
+[project.urls]
+Homepage = "https://github.com/hussain-alsaibai/snapdb"
+Repository = "https://github.com/hussain-alsaibai/snapdb"
+Issues = "https://github.com/hussain-alsaibai/snapdb/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["snapdb*"]
+exclude = ["tests*", "benchmarks*"]

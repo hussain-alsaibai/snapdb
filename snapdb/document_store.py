@@ -14,7 +14,7 @@ import json
 import os
 from typing import Any, Dict, Iterator, List, Optional, Union
 
-from snapdb import SnapDB, Schema, ColumnDef
+from .core import SnapDB, Schema, ColumnDef
 
 
 class DocumentStore:
