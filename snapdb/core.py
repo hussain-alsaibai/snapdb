@@ -488,11 +488,17 @@ class SnapDB:
             self._total_rows += sum(1 for b in slab._live if b)
             self._slabs.append(slab)
 
-    def _expand(self) -> None:
+    def _grow_to(self, new_slabs: int) -> None:
+        """Append ``new_slabs`` empty slabs to the file in a SINGLE truncate +
+        remap, instead of one truncate/reopen per slab. Each slab adds an
+        interleaved [bitmap][slab-page] unit (the layout _load expects)."""
+        if new_slabs <= 0:
+            return
         self._mm.flush()
         old_size = len(self._mm)
-        new_bitmap = self._rows_per_slab
-        new_size = old_size + self.page_size + new_bitmap
+        bitmap_size = self._rows_per_slab
+        unit = bitmap_size + self.page_size
+        new_size = old_size + new_slabs * unit
 
         self._file.close()
         with open(self.path, "r+b") as f:
@@ -502,18 +508,19 @@ class SnapDB:
         self._mm = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_WRITE)
 
         # Re-point existing slabs at the freshly-mapped buffer so every slab
-        # reads/writes through the same (current) mapping — avoids stale/
-        # incoherent reads from the now-replaced mmap object.
+        # reads/writes through the same (current) mapping.
         for s in self._slabs:
             s._mm = self._mm
 
-        old_end = old_size
-        new_bitmap_end = old_end + new_bitmap
-        for i in range(old_end, new_bitmap_end):
-            self._mm[i] = 0
+        zero = b"\x00" * bitmap_size
+        for j in range(new_slabs):
+            unit_off = old_size + j * unit
+            self._mm[unit_off:unit_off + bitmap_size] = zero  # liveness bitmap
+            slab = Slab(self.schema, self._mm, unit_off + bitmap_size, self._rows_per_slab)
+            self._slabs.append(slab)
 
-        slab = Slab(self.schema, self._mm, new_bitmap_end, self._rows_per_slab)
-        self._slabs.append(slab)
+    def _expand(self) -> None:
+        self._grow_to(1)
 
     def is_columnar(self) -> bool:
         return self._storage_type == "columnar"
@@ -587,36 +594,50 @@ class SnapDB:
                 for offset, row in enumerate(rows):
                     self._index_insert(start_idx + offset, row)
             return start_idx
+        n = len(rows)
+        if n == 0:
+            return 0
         has_indexes = self._indexes is not None and len(self._indexes._indexes) > 0
+
+        # Pre-grow the file ONCE for the whole batch (was one truncate/remap per
+        # slab — O(n/rows_per_slab) remaps). Slabs fill in order so only the last
+        # slab is ever partial; growing the exact number of units keeps that
+        # invariant (which persistence relies on).
+        free = sum(s.capacity - s.count for s in self._slabs)
+        if n > free:
+            needed = n - free
+            self._grow_to((needed + self._rows_per_slab - 1) // self._rows_per_slab)
+
         total_inserted = 0
         remaining = rows
+        # Advance through slabs from the first non-full one (no rescans).
+        slab_idx = 0
+        while slab_idx < len(self._slabs) and self._slabs[slab_idx].is_full:
+            slab_idx += 1
         while remaining:
-            # Find slab with space
-            slab = None
-            slab_idx = -1
-            for i, s in enumerate(self._slabs):
-                if not s.is_full:
-                    slab = s
-                    slab_idx = i
-                    break
-            if slab is None:
-                self._expand()
-                slab = self._slabs[-1]
-                slab_idx = len(self._slabs) - 1
-
-            # How many can we fit in this slab?
+            if slab_idx >= len(self._slabs):
+                self._grow_to(1)  # safety net; pre-grow should make this unreachable
+            slab = self._slabs[slab_idx]
             space = slab.capacity - slab.count
+            if space <= 0:
+                slab_idx += 1
+                continue
             chunk = remaining[:space]
-            if not chunk:
-                break
             local_start = slab.batch_insert(chunk)
-            if has_indexes:
+            if has_indexes or self._in_tx:
                 base = slab_idx * self._rows_per_slab + local_start
                 for offset, row in enumerate(chunk):
-                    self._index_insert(base + offset, row)
+                    gidx = base + offset
+                    if has_indexes:
+                        self._index_insert(gidx, row)
+                    # Record undo state so a batch inside transaction() rolls
+                    # back like single inserts do (atomicity).
+                    if self._in_tx:
+                        self._tx_state.append(("insert", gidx, dict(row)))
             self._total_rows += len(chunk)
             total_inserted += len(chunk)
             remaining = remaining[space:]
+            slab_idx += 1
         return total_inserted
 
     def get(self, idx: int) -> Optional[Dict[str, Any]]:

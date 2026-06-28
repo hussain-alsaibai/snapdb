@@ -226,6 +226,30 @@ class TestTransactionRollback(unittest.TestCase):
         finally:
             db.close()
 
+    def test_rollback_undoes_batch_insert(self):
+        # batch_insert inside a transaction must roll back atomically too
+        db = SnapDB(self.path, self.schema)
+        try:
+            db.create_index("name")
+            db.insert({"id": 0, "name": b"keep", "score": 1.0})
+            try:
+                with db.transaction():
+                    db.batch_insert([{"id": i, "name": f"u{i}".encode(),
+                                      "score": float(i)} for i in range(1, 50)])
+                    raise RuntimeError("force rollback")
+            except RuntimeError:
+                pass
+            self.assertEqual(len(db), 1)
+            self.assertEqual(db.find(name=b"u10"), [])
+            self.assertEqual(len(db.find(name=b"keep")), 1)
+            # a committed batch persists
+            with db.transaction():
+                db.batch_insert([{"id": i, "name": b"c", "score": float(i)}
+                                 for i in range(1, 6)])
+            self.assertEqual(len(db), 6)
+        finally:
+            db.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
