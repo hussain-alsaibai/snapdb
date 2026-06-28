@@ -53,8 +53,8 @@ class Metrics:
         """Return a Prometheus-like text report."""
         lines = []
         uptime = self._now() - self._start_time
-        lines.append(f"# HELP snapdb_uptime_seconds Seconds since metrics started")
-        lines.append(f"# TYPE snapdb_uptime_seconds gauge")
+        lines.append("# HELP snapdb_uptime_seconds Seconds since metrics started")
+        lines.append("# TYPE snapdb_uptime_seconds gauge")
         lines.append(f"snapdb_uptime_seconds {uptime:.3f}")
 
         with self._lock:
@@ -77,7 +77,6 @@ class Metrics:
                 p50 = pct(50)
                 p95 = pct(95)
                 p99 = pct(99)
-                avg = sum(sorted_vals) / count
                 lines.append(f"# HELP snapdb_{metric}_latency_seconds Latency of {metric}")
                 lines.append(f"# TYPE snapdb_{metric}_latency_seconds summary")
                 lines.append(f"snapdb_{metric}_latency_seconds{{quantile=\"0.5\"}} {p50:.6f}")

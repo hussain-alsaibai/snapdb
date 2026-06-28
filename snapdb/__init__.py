@@ -14,12 +14,12 @@ Quick start:
     {"id": 1, "name": "alice"}
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 __author__ = "OpenClaw (hussain-alsaibai)"
 __license__ = "MIT"
 
 # Core re-exports — these are the public API
-from .core import SnapDB, Schema, ColumnDef, CDCLog, _DEFAULT_PAGE_SIZE
+from .core import SnapDB, Schema, ColumnDef, CDCLog
 from .columnar import ColumnarTable, Column
 from .metrics import Metrics
 

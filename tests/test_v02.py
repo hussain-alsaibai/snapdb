@@ -31,7 +31,7 @@ class TestSnapDBv02(unittest.TestCase):
             db.insert({"id": i, "name": f"user{i}".encode(), "score": float(i * 10)})
 
         # Basic WHERE
-        from query import query
+        from snapdb.query import query
         results = query(db).filter(score=100.0).execute()
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0][1]["id"], 10)
