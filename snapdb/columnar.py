@@ -9,6 +9,7 @@ v0.5.0: Delta encoding for monotonic numeric columns.
 v0.6.0: Vectorized filtering, auto-indexing, NumPy export.
 v0.7.0: Frame-of-Reference + bit packing for bounded numeric ranges.
 v0.8.0: Optional NumPy-accelerated aggregates over the zero-copy column buffer.
+v0.9.0: NumPy-accelerated select_where masks + count_where.
 """
 
 from __future__ import annotations
@@ -991,19 +992,137 @@ class ColumnarTable:
                     mask[i] = 1
         return mask
 
+    def count_where(self, conditions, combine: str = "and",
+                    use_numpy: Optional[bool] = None) -> int:
+        """Count rows matching the conditions, without materializing any rows.
+
+        A fast analytical primitive (``SELECT COUNT(*) WHERE ...``): builds the
+        condition masks and counts the matches. NumPy-accelerated when available.
+        """
+        if combine not in ("and", "or"):
+            raise ValueError(f"combine must be 'and' or 'or', got {combine!r}")
+        norm = self._normalize_conditions(conditions)
+        n = self._row_count
+        if n == 0:
+            return 0
+        materialized: Dict[str, List[Any]] = {}
+        if _HAS_NUMPY and (use_numpy is None or use_numpy):
+            import numpy as np
+            live = np.frombuffer(self._col_list[0]._nullmask, dtype=np.int8) == 0
+            if not norm:
+                return int(live.sum())
+            masks = [self._condition_mask_numpy(self.columns[c], op, v, materialized, np)
+                     for (c, op, v) in norm]
+            comb = masks[0]
+            if combine == "or":
+                for m in masks[1:]:
+                    comb = comb | m
+            else:
+                for m in masks[1:]:
+                    comb = comb & m
+            return int((comb & live).sum())
+        # Pure-Python: combine byte masks as a big integer and popcount.
+        live = bytearray(n)
+        first_nullmask = self._col_list[0]._nullmask
+        for i in range(n):
+            if not first_nullmask[i]:
+                live[i] = 1
+        live_int = int.from_bytes(live, "little")
+        if not norm:
+            return bin(live_int).count("1")
+        masks = [int.from_bytes(self._condition_mask(c, op, v, materialized), "little")
+                 for (c, op, v) in norm]
+        comb = masks[0]
+        if combine == "or":
+            for m in masks[1:]:
+                comb |= m
+        else:
+            for m in masks[1:]:
+                comb &= m
+        return bin(comb & live_int).count("1")
+
+    def _condition_mask_numpy(self, col: "Column", op: str, value: Any,
+                              materialized: Dict[str, List[Any]], np):
+        """Build a boolean NumPy mask for one condition. Plain numeric columns
+        compare vectorially over the raw buffer; other columns reuse the Python
+        byte mask (converted)."""
+        if col._is_plain_numeric():
+            arr = np.frombuffer(col.buffer(), dtype=_NUMPY_DTYPE[col._data.typecode])
+            # f32 columns: compare at float64 like the pure-Python path (which
+            # widens stored float32 to float), so a literal such as 0.1 matches
+            # identically instead of at float32 precision.
+            if col._data.typecode == "f":
+                arr = arr.astype(np.float64)
+            valid = np.frombuffer(col._nullmask, dtype=np.int8) == 0
+            if op in ("eq", "=="):
+                m = arr == value
+            elif op in ("ne", "!="):
+                m = arr != value
+            elif op in ("gt", ">"):
+                m = arr > value
+            elif op in ("gte", ">="):
+                m = arr >= value
+            elif op in ("lt", "<"):
+                m = arr < value
+            elif op in ("lte", "<="):
+                m = arr <= value
+            elif op == "in":
+                m = np.isin(arr, np.asarray(list(value)))
+            elif op == "between":
+                lo, hi = value
+                m = (arr >= lo) & (arr <= hi)
+            else:  # pragma: no cover - ops are validated upstream
+                m = np.zeros(arr.shape[0], dtype=bool)
+            return m & valid  # nulls never match
+        bm = self._condition_mask(col.name, op, value, materialized)
+        return np.frombuffer(bytes(bm), dtype=np.int8) != 0
+
+    def _select_where_numpy(self, norm, col_names, n, limit, offset, combine, materialized):
+        import numpy as np
+        live = np.frombuffer(self._col_list[0]._nullmask, dtype=np.int8) == 0
+        if not norm:
+            final = live
+        else:
+            masks = [self._condition_mask_numpy(self.columns[c], op, v, materialized, np)
+                     for (c, op, v) in norm]
+            comb = masks[0]
+            if combine == "or":
+                for m in masks[1:]:
+                    comb = comb | m
+            else:
+                for m in masks[1:]:
+                    comb = comb & m
+            final = comb & live
+        idx = np.nonzero(final)[0]
+        if offset:
+            idx = idx[offset:]
+        if limit is not None:
+            idx = idx[:limit]
+        if idx.size == 0:
+            return []
+        for c in col_names:
+            if c not in materialized:
+                materialized[c] = self.columns[c].tolist()
+        proj = [(name, materialized[name]) for name in col_names]
+        return [{name: vals[i] for name, vals in proj} for i in idx.tolist()]
+
     def select_where(self, conditions, columns: Optional[List[str]] = None,
                      limit: Optional[int] = None, offset: int = 0,
-                     combine: str = "and") -> List[Dict[str, Any]]:
+                     combine: str = "and",
+                     use_numpy: Optional[bool] = None) -> List[Dict[str, Any]]:
         """Filter rows with one or more conditions, combined vectorially.
 
         ``conditions`` is a list of ``(column, op, value)`` triples (op in
         eq/ne/gt/gte/lt/lte/in/between) or the dict shorthand. Each condition is
-        evaluated column-at-a-time into a bitmask; masks are combined with
-        C-speed big-integer ``AND``/``OR`` (``combine``), so multi-condition
-        ``WHERE`` avoids building a row dict per row. Returns projected rows.
+        evaluated column-at-a-time into a mask; masks are combined with
+        ``AND``/``OR`` (``combine``). When NumPy is installed the masks are built
+        vectorially over the column buffers (issue #14); ``use_numpy=False``
+        forces the pure-Python big-integer path. Returns projected rows.
         """
         if combine not in ("and", "or"):
             raise ValueError(f"combine must be 'and' or 'or', got {combine!r}")
+        if limit is not None and limit <= 0:
+            return []
         norm = self._normalize_conditions(conditions)
         n = self._row_count
         if n == 0:
@@ -1018,6 +1137,10 @@ class ColumnarTable:
             col_names = columns
 
         materialized: Dict[str, List[Any]] = {}
+
+        if _HAS_NUMPY and (use_numpy is None or use_numpy):
+            return self._select_where_numpy(norm, col_names, n, limit, offset,
+                                            combine, materialized)
 
         # Live rows: exclude deleted rows via the first-column-null heuristic
         # (matching select()).
