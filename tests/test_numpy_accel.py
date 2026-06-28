@@ -110,5 +110,58 @@ class TestNumpyAggregateParity(unittest.TestCase):
         self.assertEqual(t.aggregate("x", "sum", use_numpy=False), sum(vals))
 
 
+@unittest.skipUnless(_NUMPY, "numpy not installed")
+class TestNumpyFilterParity(unittest.TestCase):
+    def setUp(self):
+        rnd = random.Random(99)
+        self.t = ColumnarTable("t", [("id", "i32"), ("age", "i32"),
+                                     ("status", "bytes:8"), ("temp", "f64"),
+                                     ("flag", "bool")])
+        self.t.batch_insert([
+            {"id": i, "age": 20 + rnd.randint(0, 60),
+             "status": rnd.choice([b"active", b"idle", b"banned"]),
+             "temp": rnd.uniform(0, 100), "flag": i % 3 == 0}
+            for i in range(2000)
+        ])
+        self.t.delete(0)
+        self.t.delete(11)
+        self.queries = [
+            ([("age", ">", 40)], "and"),
+            ([("age", ">", 40), ("temp", "<", 50.0)], "and"),
+            ([("age", ">", 40), ("status", "==", b"active"), ("temp", "<", 50.0)], "and"),
+            ([("age", "<", 25), ("age", ">", 70)], "or"),
+            ([("age", "between", (30, 40))], "and"),
+            ([("status", "in", [b"active", b"banned"])], "and"),
+            ([("age", "in", [25, 30, 35])], "and"),
+            ([("flag", "==", True)], "and"),
+            ([("age", "!=", 50)], "and"),
+            ([], "and"),
+        ]
+
+    def _ids(self, rows):
+        return sorted(r["id"] for r in rows)
+
+    def test_select_where_parity(self):
+        for conds, comb in self.queries:
+            a = self.t.select_where(conds, combine=comb, columns=["id"], use_numpy=True)
+            b = self.t.select_where(conds, combine=comb, columns=["id"], use_numpy=False)
+            self.assertEqual(self._ids(a), self._ids(b), f"{conds} {comb}")
+
+    def test_select_where_limit_offset_parity(self):
+        a = self.t.select_where([("age", ">", 30)], columns=["id", "age"],
+                                limit=15, offset=7, use_numpy=True)
+        b = self.t.select_where([("age", ">", 30)], columns=["id", "age"],
+                                limit=15, offset=7, use_numpy=False)
+        self.assertEqual(a, b)
+
+    def test_count_where_parity(self):
+        for conds, comb in self.queries:
+            a = self.t.count_where(conds, combine=comb, use_numpy=True)
+            b = self.t.count_where(conds, combine=comb, use_numpy=False)
+            ref = len(self.t.select_where(conds, combine=comb, use_numpy=False))
+            self.assertEqual(a, b, f"{conds} {comb}")
+            self.assertEqual(a, ref, f"{conds} {comb}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

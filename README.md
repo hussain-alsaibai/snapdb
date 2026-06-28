@@ -33,6 +33,7 @@ pip install snapdb
 
 - **Columnar engine** — column-oriented per-column `array.array` storage; full-scan aggregation **~27× faster than SQLite** at a fraction of the memory
 - **NumPy-accelerated aggregates** *(optional, v0.8.0)* — when NumPy is installed, `aggregate()` runs over the zero-copy column buffer (**~530M rows/s**, on par with pandas); pure-Python remains the zero-dependency default
+- **NumPy-accelerated filters** *(optional, v0.9.0)* — `select_where()` builds masks vectorially; `count_where()` (filtered count, no row materialization) hits **~314M rows/s** on numeric predicates (~166× the pure-Python path)
 - **Lowest memory footprint of the field** — ~2.2 MB / 100K rows vs SQLite 2.9 MB, pandas 11 MB, plain `dict` 22 MB ([benchmarks](#benchmarks))
 - **Vectorized multi-condition filters** *(v0.6.0)* — `select_where()` combines per-column bitmasks with C-speed big-integer `AND`/`OR` (**~2× faster** selective `WHERE`)
 - **O(1) delta-encoded reads** *(v0.6.0)* — lazy reconstruction cache turns delta scans from O(n²) into O(n) (orders of magnitude faster)
@@ -195,12 +196,13 @@ db = ColumnarTable("survey", schema, for_columns=["age", "rating", "score"])
 - **Bit-packed**: Python `int` bitmask (same technique as v0.3.2 booleans)
 - **Transparent**: reads return full values, no API changes
 
-## Vectorized Filtering (v0.6.0)
+## Vectorized Filtering (v0.6.0, NumPy-accelerated in v0.9.0)
 
-`select_where()` evaluates each condition column-at-a-time into a bitmask and
-combines the masks with C-speed big-integer `AND`/`OR`, so multi-condition
-`WHERE` never builds a Python dict per row. It is **~2× faster** than a
-row-predicate `select()` on selective queries.
+`select_where()` evaluates each condition column-at-a-time into a mask and
+combines them with `AND`/`OR`. With NumPy installed the masks are built
+vectorially over the column buffers (pure-Python big-integer masks otherwise).
+For filtered counts, `count_where()` skips row materialization entirely and runs
+at **~314M rows/s** on numeric predicates (~166× the pure-Python path).
 
 ```python
 db = SnapDB("events.snap", schema, storage_type="columnar")
@@ -217,6 +219,9 @@ db.select_where([("age", "between", (30, 40)), ("country", "in", [b"US", b"CA"])
 
 # dict shorthand
 db.select_where({"status": b"active", "age": {"gte": 21}})
+
+# fast filtered count — no rows materialized (NumPy-accelerated)
+db.count_where([("age", ">", 30), ("temp", "<", 35.0)])
 ```
 
 ## Auto-Indexing (v0.6.0)
@@ -273,7 +278,7 @@ _100,000 rows · 50,000 point reads · best of 5 · Python 3.13 · win32 (NumPy 
 | Bulk insert | rows/s | 467,309 | 11,173 | 770,788 | 794,461 | 11,139,083 |
 | Point read (PK) | ops/s | 86,243 | 87,836 | 370,698 | 32,296 | 5,494,807 |
 | Full scan + SUM | rows/s | 529,660,985 | 483,067 | 19,910,403 | 513,874,544 | 19,488,619 |
-| 3-cond filter | rows/s | 1,205,272 | 470,223 | 11,842,168 | 19,827,894 | 13,811,773 |
+| 3-cond filter | rows/s | 2,259,928 | 470,223 | 11,842,168 | 19,827,894 | 13,811,773 |
 | Memory footprint | MB | 2.2 | n/a | 2.9 | 11.0 | 22.5 |
 <!-- BENCH:END -->
 
@@ -351,6 +356,10 @@ on Linux (3.9–3.13) and Windows, and the benchmark on every push and PR.
 
 ## Version History
 
+- **v0.9.0** — NumPy-accelerated filters ([#14](https://github.com/hussain-alsaibai/snapdb/issues/14)):
+  - `select_where()` builds condition masks vectorially over the column buffers when NumPy is installed (~2× faster); `use_numpy=False` forces the pure-Python path
+  - New `count_where()` — filtered row count with no materialization, **~314M rows/s** on numeric predicates (~166×). Exact parity with the pure-Python path verified
+  - Bytes/encoded conditions fall back to the Python mask; mixed queries still accelerate their numeric conditions
 - **v0.8.0** — Optional NumPy-accelerated aggregates ([#14](https://github.com/hussain-alsaibai/snapdb/issues/14)):
   - `aggregate()` runs `sum`/`min`/`max`/`avg` over the zero-copy column buffer with NumPy when it's installed — **~13–27× faster** (full-scan SUM ~530M rows/s, on par with pandas)
   - Auto-enabled when NumPy is present; `use_numpy=False` forces the pure-Python path; exact parity verified (integers exact, floats within tolerance)

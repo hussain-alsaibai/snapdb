@@ -900,9 +900,9 @@ class SnapDB:
         return self._table.select_column(column_name)
 
     def select_where(self, conditions, columns=None, limit=None, offset=0,
-                     combine="and"):
+                     combine="and", use_numpy=None):
         """Vectorized multi-condition filter (columnar only). See
-        :meth:`ColumnarTable.select_where`."""
+        :meth:`ColumnarTable.select_where`. NumPy-accelerated when available."""
         if not self.is_columnar():
             raise RuntimeError("select_where requires columnar storage")
         # Auto-indexing watches single-column equality filters too.
@@ -911,7 +911,16 @@ class SnapDB:
                 if op in ("eq", "=="):
                     self._note_access(col)
         return self._table.select_where(conditions, columns=columns, limit=limit,
+                                        use_numpy=use_numpy,
                                         offset=offset, combine=combine)
+
+    def count_where(self, conditions, combine="and", use_numpy=None):
+        """Count rows matching conditions without materializing them (columnar
+        only). NumPy-accelerated when available. See
+        :meth:`ColumnarTable.count_where`."""
+        if not self.is_columnar():
+            raise RuntimeError("count_where requires columnar storage")
+        return self._table.count_where(conditions, combine=combine, use_numpy=use_numpy)
 
     def to_numpy(self, column_name: str, zero_copy: bool = False):
         """Export a column as a NumPy array (columnar only; requires numpy)."""
