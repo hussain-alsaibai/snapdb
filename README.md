@@ -13,6 +13,7 @@ pip install snapdb
 - **Columnar storage engine** — ClickHouse-inspired layout with per-column `array.array` storage, 7.5M+ rows/sec aggregate
 - **Precompiled struct format** — single `struct.pack`/`unpack` per row (1.6–1.9× faster encode/decode)
 - **Bit-packed booleans** — Python `int` bitmask: ~8× memory reduction vs `array.array('b')`
+- **Dictionary encoding** — transparent per-column dictionary for low-cardinality strings: **3× memory reduction** (v0.4.0)
 - **Hash index** — O(1) `create_index()` / `lookup()` on any column, auto-maintained on insert/update/delete
 - **Batch insert** — `batch_insert()` 5–10× faster than per-row inserts
 - **Metrics** — Prometheus-style QPS, latency histograms (p50/p95/p99), operation counters
@@ -76,7 +77,42 @@ db = SnapDB("data.snap", schema, metrics=Metrics())
 | `storage_type="row"` | OLTP, full-row access | 0.6 MB / 50K rows | 196K ops/sec | ~400K rows/sec |
 | `storage_type="columnar"` | OLAP, analytics | 1.5 MB / 50K rows | 656K ops/sec | 7.5M rows/sec |
 
+## Dictionary Encoding (v0.4.0)
+
+For columns with few unique string values (status, category, type, country), dictionary encoding reduces memory by **3×**:
+
+```python
+from snapdb import ColumnarTable
+
+schema = [
+    ("id", "i32"),
+    ("status", "bytes:20"),     # "active", "inactive", "pending" — 3 unique
+    ("category", "bytes:20"),   # "electronics", "books", "clothing" — 5 unique
+    ("score", "f32"),
+]
+
+# Enable dict encoding on low-cardinality columns
+db = ColumnarTable("products", schema, dict_columns=["status", "category"])
+```
+
+| Metric | Raw | Dict-Encoded | Improvement |
+|--------|-----|--------------|-------------|
+| Memory (100K rows) | 4.0 MB | **1.34 MB** | **3.0× reduction** |
+| Insert | 0.137s | 0.159s | ~15% overhead (acceptable) |
+| Data integrity | — | ✅ 100% | Verified |
+
+- **Transparent**: insert/query work with raw strings
+- **Auto-fallback**: switches to raw when unique count > threshold (default 256)
+- **Per-column**: specify which columns to encode via `dict_columns=[]`
+
 ## Benchmarks (100K rows)
+
+**Dictionary Encoding:**
+
+| Metric | Raw | Dict-Encoded | Improvement |
+|--------|-----|--------------|-------------|
+| Memory | 4.0 MB | **1.34 MB** | **3.0×** |
+| Insert | 0.137s | 0.159s | ~15% |
 
 **vs DuckDB, SQLite, Pure Dict:**
 
@@ -132,6 +168,7 @@ python -m tests.test_document_store
 
 ## Version History
 
+- **v0.4.0** — Dictionary encoding (3× memory reduction for low-cardinality strings)
 - **v0.3.2** — Precompiled struct format, hash index, bit-packed booleans
 - **v0.3.1** — Batch insert, optimized columnar, comprehensive benchmarks
 - **v0.3.0** — Columnar engine, metrics, CDC

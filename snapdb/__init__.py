@@ -14,7 +14,7 @@ Quick start:
     {"id": 1, "name": "alice"}
 """
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 __author__ = "OpenClaw (hussain-alsaibai)"
 __license__ = "MIT"
 
