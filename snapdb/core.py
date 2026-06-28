@@ -459,19 +459,34 @@ class SnapDB:
         self.schema = Schema.from_json(schema_json)
         self._rows_per_slab = page_size // self.schema.row_width
 
+        # On-disk layout after the header+schema is a repeating unit of
+        # [bitmap (rows_per_slab bytes)][slab (page_size bytes)], appended once
+        # per slab by _create/_expand. Read it back with that exact geometry.
         bitmap_size = self._rows_per_slab
-        data_offset = schema_offset + bitmap_size
+        unit = bitmap_size + self.page_size
         file_size = len(self._mm)
-        slab_count = (file_size - data_offset) // self.page_size
+        slab_count = (file_size - schema_offset) // unit
 
+        # Remember the geometry so close()/flush() can persist liveness bitmaps.
+        self._schema_offset = schema_offset
+        self._bitmap_size = bitmap_size
+        self._unit = unit
+
+        # `_count` is the high-water insert position (NOT the live count): a
+        # deleted row keeps its slot. Slabs fill in order and a slab only grows
+        # once full, so every slab except the last is at capacity; the last
+        # slab's high-water is persisted in the header `flags` field.
         for i in range(slab_count):
-            slab_off = data_offset + i * self.page_size
+            bitmap_start = schema_offset + i * unit
+            slab_off = bitmap_start + bitmap_size
             slab = Slab(self.schema, self._mm, slab_off, self._rows_per_slab)
-            bitmap_start = schema_offset + i * bitmap_size
             slab._live = bytearray(self._mm[bitmap_start : bitmap_start + bitmap_size])
-            slab._count = sum(1 for b in slab._live if b)
+            if i < slab_count - 1:
+                slab._count = self._rows_per_slab
+            else:
+                slab._count = min(flags, self._rows_per_slab)
+            self._total_rows += sum(1 for b in slab._live if b)
             self._slabs.append(slab)
-            self._total_rows += slab._count
 
     def _expand(self) -> None:
         self._mm.flush()
@@ -485,6 +500,12 @@ class SnapDB:
 
         self._file = open(self.path, "r+b")
         self._mm = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_WRITE)
+
+        # Re-point existing slabs at the freshly-mapped buffer so every slab
+        # reads/writes through the same (current) mapping — avoids stale/
+        # incoherent reads from the now-replaced mmap object.
+        for s in self._slabs:
+            s._mm = self._mm
 
         old_end = old_size
         new_bitmap_end = old_end + new_bitmap
@@ -786,8 +807,39 @@ class SnapDB:
             for local_idx, raw in slab.iter_raw():
                 yield base + local_idx, raw
 
+    def _persist_bitmaps(self) -> None:
+        """Write each slab's liveness bitmap into the mmap so row liveness
+        survives close()/reopen. Row payloads are already written to the mmap on
+        insert; the in-memory ``_live`` bitmaps are what needs flushing.
+
+        Also records the last slab's high-water row count in the header `flags`
+        field so the insert position can be restored exactly on reopen.
+        """
+        if self.is_columnar() or self._mm is None or not self._slabs:
+            return
+        base = self._schema_offset
+        unit = self._unit
+        bs = self._bitmap_size
+        for i, slab in enumerate(self._slabs):
+            off = base + i * unit
+            self._mm[off : off + bs] = bytes(slab._live)
+        last_count = self._slabs[-1]._count if self._slabs else 0
+        self._mm[:_HEADER_SIZE] = struct.pack(
+            _HEADER_FMT, _MAGIC, _VERSION, self.page_size,
+            last_count, self._schema_offset)
+
+    def flush(self) -> None:
+        """Persist liveness bitmaps and flush the mmap to disk (row storage)."""
+        if self.is_columnar() or self._mm is None:
+            return
+        self._persist_bitmaps()
+        self._mm.flush()
+
     def close(self) -> None:
         import gc
+        # Persist liveness bitmaps and flush BEFORE releasing slabs/mmap so the
+        # database can be reopened with all rows intact.
+        self._persist_bitmaps()
         # Slabs each hold a reference to the mmap, which would keep the mapping
         # alive (and the file locked on Windows) even after we drop our own
         # reference. Release those first so mmap.close() can actually unmap.
@@ -990,6 +1042,8 @@ class SnapDB:
     def checkpoint(self) -> None:
         if self.is_columnar():
             raise RuntimeError("Checkpoint not supported in columnar storage")
+        # Persist liveness + data so a crash after checkpoint reopens cleanly.
+        self.flush()
         if self._wal is not None:
             self._wal.clear()
 

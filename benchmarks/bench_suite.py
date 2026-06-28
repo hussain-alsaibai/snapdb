@@ -30,7 +30,6 @@ import json
 import os
 import random
 import sqlite3
-import statistics
 import sys
 import tempfile
 import time
@@ -41,7 +40,6 @@ from typing import Callable, Dict, List, Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from snapdb import SnapDB, Schema, ColumnDef  # noqa: E402
-from snapdb.columnar import ColumnarTable  # noqa: E402
 
 try:
     import pandas as pd
