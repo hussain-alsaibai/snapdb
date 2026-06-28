@@ -672,8 +672,10 @@ class SnapDB:
         if self.is_columnar():
             indexes = getattr(self._table, "_indexes", None)
             if indexes is not None and column_name in indexes:
-                idx = indexes[column_name].get(value)
-                return self._table.get(idx) if idx is not None else None
+                # Index keys are decoded values; query with the normalized value
+                # and return the first (smallest-index) match to match the scan.
+                rows = indexes[column_name].get(norm)
+                return self._table.get(min(rows)) if rows else None
             col = self._table.columns[column_name]
             for i in range(self._table._row_count):
                 if col._nullmask[i] == 0 and col[i] == norm:
@@ -698,7 +700,7 @@ class SnapDB:
                 for col_name in indexes:
                     val = self._table.columns[col_name][idx]
                     if val is not None:
-                        indexes[col_name][val] = idx
+                        indexes[col_name].setdefault(val, set()).add(idx)
             return
         if self._indexes is not None:
             for hidx in self._indexes._indexes.values():
@@ -713,11 +715,13 @@ class SnapDB:
                 for col_name, idx_map in indexes.items():
                     if old_row is not None:
                         old_val = old_row.get(col_name)
-                        if old_val is not None and idx_map.get(old_val) == idx:
-                            del idx_map[old_val]
+                        if old_val is not None and old_val in idx_map:
+                            idx_map[old_val].discard(idx)
+                            if not idx_map[old_val]:
+                                del idx_map[old_val]
                     new_val = self._table.columns[col_name][idx]
                     if new_val is not None:
-                        idx_map[new_val] = idx
+                        idx_map.setdefault(new_val, set()).add(idx)
             return
         if self._indexes is not None and old_row is not None:
             for hidx in self._indexes._indexes.values():
@@ -730,8 +734,10 @@ class SnapDB:
             if indexes and row is not None:
                 for col_name, idx_map in indexes.items():
                     val = row.get(col_name)
-                    if val is not None and idx_map.get(val) == idx:
-                        del idx_map[val]
+                    if val is not None and val in idx_map:
+                        idx_map[val].discard(idx)
+                        if not idx_map[val]:
+                            del idx_map[val]
             return
         if self._indexes is not None and row is not None:
             for hidx in self._indexes._indexes.values():
@@ -935,10 +941,12 @@ class SnapDB:
             if not hasattr(self._table, "_indexes"):
                 self._table._indexes = {}
             col = self._table.columns[column]
-            index: Dict[Any, int] = {}
+            # value -> set of row indices (handles duplicates; lookup returns the
+            # smallest index so it agrees with a first-match scan).
+            index: Dict[Any, set] = {}
             for i in range(self._table._row_count):
                 if col._nullmask[i] == 0:
-                    index[col[i]] = i
+                    index.setdefault(col[i], set()).add(i)
             self._table._indexes[column] = index
             return
         if self._indexes is None:

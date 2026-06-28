@@ -96,6 +96,57 @@ class TestVectorizedPredicates(unittest.TestCase):
         got = self.t.select_where([("id", "==", 0)])
         self.assertEqual(got, [])
 
+    def test_row_count_not_multiple_of_8(self):
+        # exercises the bitmask int<->bytes round-trip at a non-byte-aligned size
+        t = ColumnarTable("t", [("x", "i32")])
+        t.batch_insert([{"x": i} for i in range(1003)])
+        got = {r["x"] for r in t.select_where([("x", ">=", 1000)])}
+        self.assertEqual(got, {1000, 1001, 1002})
+        # last row matches and is returned (high bit set)
+        self.assertEqual(t.select_where([("x", "==", 1002)]), [{"x": 1002}])
+
+
+class TestColumnarLookupConsistency(unittest.TestCase):
+    """Regressions found by adversarial review of the v0.6.0 feature diff."""
+
+    def setUp(self):
+        self.path = _tmp()
+
+    def tearDown(self):
+        _cleanup(self.path)
+
+    def test_bytes_lookup_through_index(self):
+        # lookup(col, bytes) must keep working after a columnar index is built
+        schema = Schema([ColumnDef("id", "i64"), ColumnDef("name", "bytes:16")])
+        db = SnapDB(self.path, schema, storage_type="columnar")
+        try:
+            db.insert({"id": 1, "name": b"alice"})
+            db.insert({"id": 2, "name": b"bob"})
+            self.assertEqual(db.lookup("name", b"alice")["id"], 1)  # scan
+            db.create_index("name")
+            self.assertEqual(db.lookup("name", b"alice")["id"], 1)  # indexed
+            self.assertEqual(db.lookup("name", "alice")["id"], 1)   # str form too
+            self.assertIsNone(db.lookup("name", b"nobody"))
+        finally:
+            db.close()
+
+    def test_duplicate_lookup_is_first_match_scan_and_index_agree(self):
+        schema = Schema([ColumnDef("id", "i64"), ColumnDef("grp", "i64")])
+        db = SnapDB(self.path, schema, storage_type="columnar",
+                    auto_index=True, auto_index_threshold=3)
+        try:
+            for i in range(6):
+                db.insert({"id": i, "grp": i % 2})  # grp==1 -> ids 1,3,5
+            # before and after the auto-index builds, the same query returns the
+            # first match (id 1), never silently flipping to the last (id 5)
+            results = [db.lookup("grp", 1)["id"] for _ in range(5)]
+            self.assertEqual(results, [1, 1, 1, 1, 1])
+            # deleting the first match repoints to the next, still consistent
+            db.delete(1)
+            self.assertEqual(db.lookup("grp", 1)["id"], 3)
+        finally:
+            db.close()
+
 
 class TestAutoIndex(unittest.TestCase):
     def setUp(self):
@@ -157,10 +208,18 @@ class TestZeroCopyExport(unittest.TestCase):
             arr = db.to_numpy("v")
             self.assertEqual(arr.shape, (100,))
             self.assertEqual(float(arr.sum()), float(sum(range(100))))
+            # default to_numpy() is an independent COPY: mutating it must not
+            # alias the column, and the column must stay insertable (not locked).
+            self.assertIsNone(arr.base)
+            arr[0] = 999.0
+            self.assertEqual(db.get(0)["v"], 0.0)
+            db.insert({"id": 100, "v": 7.0})
+            self.assertEqual(db.get(100)["v"], 7.0)
+
             view = db.to_numpy("v", zero_copy=True)
             self.assertIsNotNone(view.base)  # shares memory
             buf = db.column_buffer("id")
-            self.assertEqual(buf.nbytes, 100 * 4)
+            self.assertEqual(buf.nbytes, 101 * 4)
             del view, buf  # release buffer locks before close
         finally:
             db.close()
