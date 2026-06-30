@@ -175,6 +175,28 @@ class TestNumpyFilterParity(unittest.TestCase):
                 sorted(r["id"] for r in t.select_where([cond], columns=["id"], use_numpy=False)),
                 cond)
 
+    def test_dict_encoded_filter_parity(self):
+        # dict-encoded string column: eq/ne/in compare codes via NumPy — must
+        # match the pure-Python path, including missing values, nulls, deletes,
+        # and str-vs-bytes literals.
+        t = ColumnarTable("t", [("id", "i32"), ("status", "bytes:8")],
+                          dict_columns=["status"])
+        rnd = random.Random(7)
+        vals = [rnd.choice([b"active", b"idle", b"banned", None]) for _ in range(800)]
+        t.batch_insert([{"id": i, "status": vals[i]} for i in range(800)])
+        t.delete(0)
+        self.assertTrue(t.columns["status"]._dict_mode)
+        for cond in (("status", "==", b"active"), ("status", "!=", b"idle"),
+                     ("status", "in", [b"active", b"banned"]),
+                     ("status", "==", b"missing"), ("status", "!=", b"missing"),
+                     ("status", "in", [b"nope"]), ("status", "==", "active")):
+            a = sorted(r["id"] for r in t.select_where([cond], columns=["id"], use_numpy=True))
+            b = sorted(r["id"] for r in t.select_where([cond], columns=["id"], use_numpy=False))
+            self.assertEqual(a, b, cond)
+            self.assertEqual(t.count_where([cond], use_numpy=True),
+                             t.count_where([cond], use_numpy=False), cond)
+            self.assertEqual(t.count_where([cond], use_numpy=True), len(a), cond)
+
     def test_count_where_parity(self):
         for conds, comb in self.queries:
             a = self.t.count_where(conds, combine=comb, use_numpy=True)

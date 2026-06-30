@@ -1074,6 +1074,31 @@ class ColumnarTable:
             else:  # pragma: no cover - ops are validated upstream
                 m = np.zeros(arr.shape[0], dtype=bool)
             return m & valid  # nulls never match
+
+        # Dict-encoded string column: equality/membership can compare the
+        # integer codes (NumPy-fast) instead of per-row string comparison.
+        # (Ordering ops can't — codes aren't lexically ordered — so they fall
+        # through to the Python mask.)
+        if (col._dict_mode and not col._dict_fallback
+                and op in ("eq", "==", "ne", "!=", "in")):
+            codes = np.frombuffer(col._dict_codes, dtype=_NUMPY_DTYPE[col._dict_codes.typecode])
+            valid = np.frombuffer(col._nullmask, dtype=np.int8) == 0
+
+            def _code(v):
+                vb = v.encode("utf-8") if isinstance(v, str) else bytes(v)
+                return col._dict.get(vb)  # None if the value isn't in the dict
+
+            if op == "in":
+                wanted = [c for c in (_code(m) for m in value) if c is not None]
+                m = np.isin(codes, np.asarray(wanted)) if wanted else np.zeros(codes.shape[0], dtype=bool)
+            else:
+                c = _code(value)
+                if op in ("eq", "=="):
+                    m = (codes == c) if c is not None else np.zeros(codes.shape[0], dtype=bool)
+                else:  # ne: a value not in the dict differs from every stored value
+                    m = (codes != c) if c is not None else np.ones(codes.shape[0], dtype=bool)
+            return m & valid
+
         bm = self._condition_mask(col.name, op, value, materialized)
         return np.frombuffer(bytes(bm), dtype=np.int8) != 0
 

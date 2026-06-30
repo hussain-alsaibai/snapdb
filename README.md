@@ -356,6 +356,8 @@ on Linux (3.9–3.13) and Windows, and the benchmark on every push and PR.
 
 ## Version History
 
+- **v0.11.0** — NumPy-accelerated string filtering:
+  - `select_where()`/`count_where()` on **dict-encoded** string columns compare integer dict codes via NumPy for `eq`/`ne`/`in` instead of per-row string comparison — **~300×+** faster (dict `==` count ~969M rows/s); a mixed numeric+string filtered count now runs ~143× faster. Exact parity verified; ordering ops and non-dict bytes columns keep the Python path
 - **v0.10.0** — Fast row-store bulk insert ([#13](https://github.com/hussain-alsaibai/snapdb/issues/13)):
   - `batch_insert()` now grows the backing file in a **single** truncate + remap for the whole batch instead of one per slab — **~26× faster** (100K rows: ~5.8s → ~0.29s, now in the same ballpark as SQLite/pandas). On-disk format and durability guarantees unchanged
 - **v0.9.0** — NumPy-accelerated filters ([#14](https://github.com/hussain-alsaibai/snapdb/issues/14)):
