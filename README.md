@@ -7,9 +7,14 @@
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-A **zero-dependency, pure-Python** embedded database with a columnar analytics
-engine and a row store, memory-mapped files, lightweight column compression, and
-precompiled struct codecs — built for **maximum speed at minimum memory**.
+A **zero-dependency, pure-Python** embedded database for **single-writer, local Python
+applications**. Columnar analytics engine, row store, memory-mapped files, lightweight
+column compression, and precompiled struct codecs — built for **maximum speed at minimum
+memory** within a minimal-dependency footprint.
+
+> **Niche:** compact test fixtures, small operational datasets, embedded Python tools,
+> and NumPy-friendly analytical helpers where pulling in SQLite or a heavy binary
+> extension is undesirable. SnapDB is intentionally *not* a SQLite or DuckDB replacement.
 
 ```bash
 pip install pysnapdb
@@ -340,11 +345,12 @@ _100,000 rows · 50,000 point reads · best of 5 · Python 3.13 · win32 (NumPy 
 - **Full-scan aggregation** — **on par with pandas (~530M rows/s)** and ~27× faster than in-memory SQLite. With NumPy installed, `aggregate()` runs over the zero-copy column buffer (issue #14); without NumPy the pure-Python path still does ~58M rows/s (~3× SQLite).
 - **Embeddable** — a single mmap-backed file, no server, no C extensions.
 
-**Where it doesn't (also honestly):** pandas still wins multi-condition
-filtering (vectorized `WHERE` acceleration is the next item, [#14](https://github.com/hussain-alsaibai/snapdb/issues/14)), and SQLite's
-B-tree wins indexed point reads. SnapDB targets the lightweight-embedded-
-analytics niche. Encoding memory wins for low-cardinality / monotonic columns
-are shown above.
+**Where it doesn't (also honestly):** SQLite still wins on ACID semantics,
+SQL coverage, B-tree point reads, migrations, and ecosystem integration.
+DuckDB still wins on analytical SQL, joins, vectorized scans, and Parquet/Arrow
+workloads. Both win on multi-condition filter throughput. SnapDB's value is the
+zero-dependency footprint, direct Python dict/row APIs, and the columnar memory
+efficiency — not replacing either engine.
 
 > CI runs this suite on every push and publishes a fresh table to the workflow
 > run summary (Actions → CI → Benchmark).
@@ -408,6 +414,12 @@ on Linux (3.9–3.13) and Windows, and the benchmark on every push and PR.
 
 ## Version History
 
+- **v0.13.0** — Speed, lightweight, and reliability micro-pass:
+  - `_xor_stream` now XORs full 32-byte SHA-256 blocks with a single 256-bit integer operation instead of a 32-iteration Python byte loop — significantly faster for encrypted row/WAL/blob operations
+  - `Schema.decode_row()` accepts `memoryview` directly without an intermediate `bytes()` copy, reducing per-row allocations on every read path
+  - `Slab.iter_rows()` inlines the hot read path to avoid redundant per-row bounds and liveness checks
+  - README and roadmap updated to reflect honest niche positioning per re-evaluation (single-writer embedded Python database; not a SQLite or DuckDB replacement)
+
 - **v0.12.1** — Niche performance gap closing:
   - Added stdlib-only sorted range indexes for row-store ordered lookups (`create_range_index()` / `range_find()`), kept in sync across insert/update/delete/compact
   - Columnar `batch_update()` and `group_by()` now use column-oriented helpers when constraints/index/CDC hooks do not require the generic row path
@@ -457,12 +469,24 @@ on Linux (3.9–3.13) and Windows, and the benchmark on every push and PR.
 
 ## Roadmap & Known Limitations
 
-Current known limitations:
+**Design boundary** — SnapDB is a single-writer, local-file embedded database.
+The following are intentional non-goals; they will not be added:
 
-- SnapDB is embedded and local-file based. It does not provide server authentication, RBAC, network encryption, ODBC/JDBC/ADBC, or a SQLAlchemy dialect.
-- Joins are in-memory equi-joins, not a SQL optimizer.
-- The optional `encryption_key` protects raw files/WAL from casual plaintext recovery, but production deployments should still rely on OS permissions, key management, and encrypted volumes.
+- No SQL planner, MVCC, or CHECK/FOREIGN KEY constraints
+- No server mode, RBAC, network encryption, ODBC/JDBC/ADBC, or SQLAlchemy dialect
+- No DuckDB-style analytical engine or Parquet/Arrow integration
+- Joins are in-memory equi-joins only, not a cost-based optimizer
+
+**Current limitations:**
+
+- The optional `encryption_key` protects raw files/WAL from casual plaintext recovery; it is not a substitute for OS key management or encrypted volumes.
 - Multi-version snapshot isolation is not implemented; the file lock model is single-writer oriented.
+
+**Near-term reliability focus** (per evaluation guidance):
+
+- Lightweight per-operation benchmarks with loose CI thresholds (insert / query / range / group-by timing and memory)
+- Additional `fsck`/`repair` fixtures for corruption recovery paths
+- Narrow helper improvements (batch paths, range windows, zero-copy buffers) only where they reduce per-row Python overhead without adding dependencies
 
 ## License
 

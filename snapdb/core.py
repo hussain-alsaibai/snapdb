@@ -106,18 +106,30 @@ def _derive_key(key: Union[str, bytes, None]) -> Optional[bytes]:
 
 
 def _xor_stream(key: bytes, nonce: bytes, data: bytes) -> bytes:
-    out = bytearray(len(data))
+    n = len(data)
+    if n == 0:
+        return data
+    parts: List[bytes] = []
     pos = 0
     counter = 0
-    while pos < len(data):
+    while pos < n:
         block = hashlib.sha256(key + nonce + counter.to_bytes(8, "little")).digest()
-        for b in block:
-            if pos >= len(data):
-                break
-            out[pos] = data[pos] ^ b
-            pos += 1
+        end = min(pos + 32, n)
+        chunk = end - pos
+        if chunk == 32:
+            # Fast path: single 256-bit integer XOR avoids a 32-iteration Python loop.
+            d_int = int.from_bytes(data[pos:end], "little")
+            k_int = int.from_bytes(block, "little")
+            parts.append((d_int ^ k_int).to_bytes(32, "little"))
+        else:
+            # Tail block (< 32 bytes).
+            arr = bytearray(data[pos:end])
+            for i in range(chunk):
+                arr[i] ^= block[i]
+            parts.append(bytes(arr))
+        pos = end
         counter += 1
-    return bytes(out)
+    return b"".join(parts)
 
 
 def _pack_header(schema_offset: int, page_size: int = _DEFAULT_PAGE_SIZE) -> bytes:
@@ -243,9 +255,8 @@ class Schema:
         return struct.pack(self._struct_fmt, *values)
 
     def decode_row(self, buf: Union[bytes, memoryview]) -> Dict[str, Any]:
-        # Use precompiled struct format for speed
-        raw = bytes(buf) if isinstance(buf, memoryview) else buf
-        unpacked = struct.unpack(self._struct_fmt, raw)
+        # struct.unpack accepts memoryview directly — avoid the bytes() copy.
+        unpacked = struct.unpack(self._struct_fmt, buf)
         row: Dict[str, Any] = {}
         for col, val in zip(self.columns, unpacked):
             if col.dtype == "bool":
@@ -362,9 +373,18 @@ class Slab:
             self._live[idx] = 0
 
     def iter_rows(self) -> Iterator[Tuple[int, Dict[str, Any]]]:
+        # Inline the hot read path to avoid redundant bounds/liveness checks.
+        row_width = self.schema.row_width
+        offset = self._offset
+        mm = self._mm
+        crypt = self._crypt
         for i in range(self._count):
             if self._live[i]:
-                yield i, self.get(i)
+                start = offset + i * row_width
+                raw: bytes = bytes(memoryview(mm)[start:start + row_width])
+                if crypt is not None:
+                    raw = crypt(raw, start)
+                yield i, self.schema.decode_row(raw)
 
     def iter_raw(self) -> Iterator[Tuple[int, memoryview]]:
         for i in range(self._count):
