@@ -136,6 +136,14 @@ class RangeIndex:
         self.column = column
         self._items: List[Tuple[Any, int]] = []
 
+    def build(self, rows: List[Tuple[int, Dict[str, Any]]]) -> None:
+        self._items = [
+            (row[self.column], row_idx)
+            for row_idx, row in rows
+            if row.get(self.column) is not None
+        ]
+        self._items.sort()
+
     def insert(self, row_idx: int, row: Dict[str, Any]) -> None:
         value = row.get(self.column)
         if value is None:
@@ -160,18 +168,18 @@ class RangeIndex:
 
     def range_lookup(self, low: Any = None, high: Any = None,
                      include_low: bool = True, include_high: bool = True) -> List[int]:
-        start_key = (low, -1) if low is not None else None
-        end_key = (high, float("inf")) if high is not None else None
-
         start = 0
-        if start_key is not None:
-            start = (bisect.bisect_left if include_low else bisect.bisect_right)(
-                self._items, start_key)
+        if low is not None:
+            start = bisect.bisect_left(self._items, (low, -1))
+            if not include_low:
+                start = bisect.bisect_right(self._items, (low, float("inf")))
 
         end = len(self._items)
-        if end_key is not None:
-            end = (bisect.bisect_right if include_high else bisect.bisect_left)(
-                self._items, end_key)
+        if high is not None:
+            if include_high:
+                end = bisect.bisect_right(self._items, (high, float("inf")))
+            else:
+                end = bisect.bisect_left(self._items, (high, -1))
 
         return [row_idx for _, row_idx in self._items[start:end]]
 

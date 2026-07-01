@@ -211,6 +211,12 @@ def test_missing_required_column_and_unique_constraint_fail_cleanly():
             db.insert({"id": 1, "name": b"alice", "score": 1.0})
             with pytest.raises(ValueError, match="UNIQUE constraint"):
                 db.insert({"id": 1, "name": b"bob", "score": 2.0})
+            db.batch_insert([
+                {"id": 2, "name": b"bob", "score": 2.0},
+                {"id": 3, "name": b"cyd", "score": 3.0},
+            ])
+            with pytest.raises(ValueError, match="UNIQUE constraint"):
+                db.insert({"id": 2, "name": b"dupe", "score": 4.0})
         finally:
             db.close()
     finally:
@@ -332,13 +338,26 @@ def test_row_range_index_tracks_update_delete_and_compact():
             ])
             db.create_range_index("score")
             assert [r["id"] for r in db.range_find("score", 5.0, 8.0)] == [5, 6, 7, 8]
+            assert [
+                r["id"] for r in db.range_find(
+                    "score", 5.0, 8.0, include_low=False, include_high=False
+                )
+            ] == [6, 7]
+
+            db.batch_insert([
+                {"id": i, "name": f"u{i}".encode(), "score": float(i)}
+                for i in range(20, 25)
+            ])
+            assert [r["id"] for r in db.range_find("score", 22.0, 24.0)] == [22, 23, 24]
 
             db.update(8, {"score": 100.0})
             db.delete(5)
             assert [r["id"] for r in db.range_find("score", 5.0, 8.0)] == [6, 7]
 
             db.compact()
-            assert [r["id"] for r in db.range_find("score", 18.0, 100.0)] == [18, 19, 8]
+            assert [r["id"] for r in db.range_find("score", 18.0, 100.0)] == [
+                18, 19, 20, 21, 22, 23, 24, 8,
+            ]
         finally:
             db.close()
     finally:

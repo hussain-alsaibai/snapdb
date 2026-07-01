@@ -907,7 +907,14 @@ class SnapDB:
         n = len(rows)
         if n == 0:
             return 0
-        has_indexes = self._indexes is not None and len(self._indexes._indexes) > 0
+        has_hash_indexes = self._indexes is not None and len(self._indexes._indexes) > 0
+        has_range_indexes = bool(self._range_indexes)
+        maintain_per_row = (
+            has_hash_indexes
+            or has_range_indexes
+            or bool(self._unique_columns)
+            or self._in_tx
+        )
 
         # Pre-grow the file ONCE for the whole batch (was one truncate/remap per
         # slab — O(n/rows_per_slab) remaps). Slabs fill in order so only the last
@@ -934,13 +941,14 @@ class SnapDB:
                 continue
             chunk = remaining[:space]
             local_start = slab.batch_insert(chunk)
-            if has_indexes or self._in_tx:
+            if maintain_per_row:
                 base = slab_idx * self._rows_per_slab + local_start
                 for offset, row in enumerate(chunk):
                     gidx = base + offset
-                    if has_indexes:
+                    if has_hash_indexes or has_range_indexes:
                         self._index_insert(gidx, row)
-                    self._unique_insert(gidx, row)
+                    if self._unique_columns:
+                        self._unique_insert(gidx, row)
                     # Record undo state so a batch inside transaction() rolls
                     # back like single inserts do (atomicity).
                     if self._in_tx:
@@ -1565,8 +1573,7 @@ class SnapDB:
         if column in self._range_indexes:
             return
         idx = RangeIndex(column)
-        for row_idx, row in self:
-            idx.insert(row_idx, row)
+        idx.build(list(self))
         self._range_indexes[column] = idx
 
     def drop_range_index(self, column: str) -> None:
