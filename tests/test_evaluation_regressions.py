@@ -321,6 +321,49 @@ def test_batch_update_group_by_and_join():
         _cleanup(right_path)
 
 
+def test_row_range_index_tracks_update_delete_and_compact():
+    path = _tmp()
+    try:
+        db = SnapDB(path, _schema())
+        try:
+            db.batch_insert([
+                {"id": i, "name": f"u{i}".encode(), "score": float(i)}
+                for i in range(20)
+            ])
+            db.create_range_index("score")
+            assert [r["id"] for r in db.range_find("score", 5.0, 8.0)] == [5, 6, 7, 8]
+
+            db.update(8, {"score": 100.0})
+            db.delete(5)
+            assert [r["id"] for r in db.range_find("score", 5.0, 8.0)] == [6, 7]
+
+            db.compact()
+            assert [r["id"] for r in db.range_find("score", 18.0, 100.0)] == [18, 19, 8]
+        finally:
+            db.close()
+    finally:
+        _cleanup(path)
+
+
+def test_columnar_batch_update_and_group_by_use_columnar_helpers():
+    path = _tmp()
+    try:
+        db = SnapDB(path, _schema(), storage_type="columnar")
+        try:
+            db.batch_insert([
+                {"id": 1, "name": b"a", "score": 1.0},
+                {"id": 2, "name": b"b", "score": 2.0},
+                {"id": 3, "name": b"a", "score": 3.0},
+            ])
+            assert db.batch_update(lambda r: r["name"] == "a", {"score": 10.0}) == 2
+            assert db.group_by("name", "score", "sum") == {"a": 20.0, "b": 2.0}
+            assert db.group_by("name", "score", "avg") == {"a": 10.0, "b": 2.0}
+        finally:
+            db.close()
+    finally:
+        _cleanup(path)
+
+
 def test_document_store_json_lists_round_trip():
     path = _tmp()
     json_path = path.replace(".snap", ".json")
