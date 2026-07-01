@@ -31,10 +31,11 @@ from contextlib import contextmanager
 
 # v0.2.0 imports (optional)
 try:
-    from .index import HashIndex, MultiIndex
+    from .index import HashIndex, MultiIndex, RangeIndex
 except ImportError:
     HashIndex = None  # type: ignore
     MultiIndex = None  # type: ignore
+    RangeIndex = None  # type: ignore
 try:
     from .wal import WAL
 except ImportError:
@@ -495,6 +496,7 @@ class SnapDB:
         self._in_tx = False
         self._tx_state: List[Tuple[str, int, Optional[Dict]]] = []
         self._indexes: Optional["MultiIndex"] = None
+        self._range_indexes: Dict[str, "RangeIndex"] = {}
         self._wal: Optional["WAL"] = None
         if MultiIndex is not None:
             self._indexes = MultiIndex()
@@ -1042,6 +1044,8 @@ class SnapDB:
         if self._indexes is not None:
             for hidx in self._indexes._indexes.values():
                 hidx.insert(idx, row)
+        for ridx in self._range_indexes.values():
+            ridx.insert(idx, row)
 
     def _index_update(self, idx: int, old_row: Optional[Dict[str, Any]],
                       new_row: Dict[str, Any]) -> None:
@@ -1063,6 +1067,9 @@ class SnapDB:
         if self._indexes is not None and old_row is not None:
             for hidx in self._indexes._indexes.values():
                 hidx.update(idx, old_row, new_row)
+        if old_row is not None:
+            for ridx in self._range_indexes.values():
+                ridx.update(idx, old_row, new_row)
 
     def _index_delete(self, idx: int, row: Optional[Dict[str, Any]]) -> None:
         """Maintain indexes after a delete."""
@@ -1079,6 +1086,9 @@ class SnapDB:
         if self._indexes is not None and row is not None:
             for hidx in self._indexes._indexes.values():
                 hidx.delete(idx, row)
+        if row is not None:
+            for ridx in self._range_indexes.values():
+                ridx.delete(idx, row)
 
     def update(self, idx: int, row: Dict[str, Any]) -> None:
         with self._m_time("update"):
@@ -1155,6 +1165,12 @@ class SnapDB:
                      updates: Union[Dict[str, Any], Callable[[Dict[str, Any]], Dict[str, Any]]]) -> int:
         """Update all matching rows. Returns the number of rows updated."""
         with self._lock:
+            if (self.is_columnar()
+                    and isinstance(updates, dict)
+                    and not self._unique_columns
+                    and not getattr(self._table, "_indexes", None)
+                    and self._cdc is None):
+                return self._table.batch_update(predicate, updates)
             matches = [(idx, row) for idx, row in self if predicate(row)]
             for idx, row in matches:
                 patch = updates(row) if callable(updates) else updates
@@ -1163,6 +1179,8 @@ class SnapDB:
 
     def group_by(self, key_column: str, value_column: str, agg: str = "count") -> Dict[Any, Any]:
         """Group rows by one column and aggregate another column."""
+        if self.is_columnar():
+            return self._table.group_by(key_column, value_column, agg)
         if key_column not in self.schema._name_to_idx:
             raise KeyError(f"Unknown column: {key_column}")
         if value_column not in self.schema._name_to_idx:
@@ -1333,6 +1351,7 @@ class SnapDB:
 
             rows = [row for _, row in self]
             index_columns = list(self._indexes._indexes.keys()) if self._indexes else []
+            range_index_columns = list(self._range_indexes.keys())
             before = self.path.stat().st_size if self.path.exists() else 0
             schema_json = json.dumps(self.schema.to_json()).encode("utf-8")
             schema_offset = _HEADER_SIZE + len(schema_json)
@@ -1378,6 +1397,9 @@ class SnapDB:
                 self._indexes = MultiIndex()
                 for column in index_columns:
                     self.create_index(column)
+            self._range_indexes = {}
+            for column in range_index_columns:
+                self.create_range_index(column)
             self._rebuild_unique_constraints()
             if self._wal is not None:
                 self._wal.clear()
@@ -1531,6 +1553,48 @@ class SnapDB:
             raise RuntimeError("Indexing not supported in columnar storage")
         if self._indexes is not None and column in self._indexes:
             self._indexes.drop(column)
+
+    def create_range_index(self, column: str) -> None:
+        """Build an in-memory sorted index for range lookups on a row-store column."""
+        if self.is_columnar():
+            raise RuntimeError("Range indexes are row-storage only")
+        if RangeIndex is None:
+            raise RuntimeError("Range indexing not available (index.py missing)")
+        if column not in self.schema._name_to_idx:
+            raise KeyError(f"Unknown column: {column}")
+        if column in self._range_indexes:
+            return
+        idx = RangeIndex(column)
+        for row_idx, row in self:
+            idx.insert(row_idx, row)
+        self._range_indexes[column] = idx
+
+    def drop_range_index(self, column: str) -> None:
+        self._range_indexes.pop(column, None)
+
+    def range_find(self, column: str, low: Any = None, high: Any = None,
+                   include_low: bool = True, include_high: bool = True) -> List[Dict[str, Any]]:
+        """Return rows where ``low <= column <= high`` using a range index when present."""
+        if self.is_columnar():
+            raise RuntimeError("range_find is row-storage only")
+        if column not in self.schema._name_to_idx:
+            raise KeyError(f"Unknown column: {column}")
+        idx = self._range_indexes.get(column)
+        if idx is not None:
+            return [row for row_idx in idx.range_lookup(low, high, include_low, include_high)
+                    if (row := self.get(row_idx)) is not None]
+
+        out = []
+        for _, row in self:
+            value = row.get(column)
+            if value is None:
+                continue
+            if low is not None and (value < low if include_low else value <= low):
+                continue
+            if high is not None and (value > high if include_high else value >= high):
+                continue
+            out.append(row)
+        return out
 
     def find(self, **kwargs) -> List[Dict[str, Any]]:
         """Return all rows matching every column=value pair.

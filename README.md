@@ -43,6 +43,7 @@ pip install pysnapdb
 - **Delta encoding** — base + deltas for monotonic columns (timestamps, IDs) (v0.5.0)
 - **Bit-packed booleans** — Python `int` bitmask: ~8× smaller than `array('b')`
 - **Hash index** — `create_index()` / `lookup()` / `find()`, **kept in sync** on every insert / update / delete
+- **Range index** — `create_range_index()` / `range_find()` for ordered numeric windows without adding a B-tree dependency
 - **Durability safeguards** — row-store transactions log row data to a replayed WAL; committed transactions recover after abrupt process exit
 - **Operational safety** — per-file advisory locks, explicit `backup()` and `compact()`, optional at-rest encryption, CDC stream, Prometheus-style metrics
 - **Zero dependencies** — stdlib only (NumPy is optional, only for zero-copy export)
@@ -269,6 +270,10 @@ totals = db.group_by("country", "score", "sum")
 
 # In-memory equi-join between two SnapDB instances.
 pairs = users.join(departments, "dept_id", "id")
+
+# Ordered row-store windows without a heavyweight query planner.
+db.create_range_index("score")
+top_band = db.range_find("score", 90.0, 100.0)
 ```
 
 ## Auto-Indexing (v0.6.0)
@@ -403,6 +408,9 @@ on Linux (3.9–3.13) and Windows, and the benchmark on every push and PR.
 
 ## Version History
 
+- **v0.12.1** — Niche performance gap closing:
+  - Added stdlib-only sorted range indexes for row-store ordered lookups (`create_range_index()` / `range_find()`), kept in sync across insert/update/delete/compact
+  - Columnar `batch_update()` and `group_by()` now use column-oriented helpers when constraints/index/CDC hooks do not require the generic row path
 - **v0.12.0** — Production-readiness hardening:
   - Row-store transactions now append row-level WAL records and replay committed transactions on open, so committed transactional writes recover after abrupt process exit
   - `close()` inside an open transaction rolls back instead of committing partial work; nested transactions now fail loudly

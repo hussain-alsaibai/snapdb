@@ -5,7 +5,8 @@ Auto-updates on insert/update/delete.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Set
+import bisect
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 class HashIndex:
@@ -126,3 +127,53 @@ class MultiIndex:
 
     def __repr__(self) -> str:
         return f"MultiIndex({list(self._indexes.keys())})"
+
+
+class RangeIndex:
+    """Sorted in-memory range index for ordered scalar columns."""
+
+    def __init__(self, column: str) -> None:
+        self.column = column
+        self._items: List[Tuple[Any, int]] = []
+
+    def insert(self, row_idx: int, row: Dict[str, Any]) -> None:
+        value = row.get(self.column)
+        if value is None:
+            return
+        bisect.insort(self._items, (value, row_idx))
+
+    def delete(self, row_idx: int, row: Dict[str, Any]) -> None:
+        value = row.get(self.column)
+        if value is None:
+            return
+        pos = bisect.bisect_left(self._items, (value, row_idx))
+        if pos < len(self._items) and self._items[pos] == (value, row_idx):
+            self._items.pop(pos)
+
+    def update(self, row_idx: int, old_row: Dict[str, Any], new_row: Dict[str, Any]) -> None:
+        old_value = old_row.get(self.column)
+        new_value = new_row.get(self.column)
+        if old_value == new_value:
+            return
+        self.delete(row_idx, old_row)
+        self.insert(row_idx, new_row)
+
+    def range_lookup(self, low: Any = None, high: Any = None,
+                     include_low: bool = True, include_high: bool = True) -> List[int]:
+        start_key = (low, -1) if low is not None else None
+        end_key = (high, float("inf")) if high is not None else None
+
+        start = 0
+        if start_key is not None:
+            start = (bisect.bisect_left if include_low else bisect.bisect_right)(
+                self._items, start_key)
+
+        end = len(self._items)
+        if end_key is not None:
+            end = (bisect.bisect_right if include_high else bisect.bisect_left)(
+                self._items, end_key)
+
+        return [row_idx for _, row_idx in self._items[start:end]]
+
+    def __len__(self) -> int:
+        return len(self._items)

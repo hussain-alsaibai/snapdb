@@ -863,6 +863,73 @@ class ColumnarTable:
             else:
                 col._data[idx] = 0
 
+    def _matching_indices(self, predicate: Optional[Callable[[Dict[str, Any]], bool]]) -> List[int]:
+        first_nullmask = self._col_list[0]._nullmask
+        if predicate is None:
+            return [i for i in range(self._row_count) if not first_nullmask[i]]
+
+        mat = {col.name: col.tolist() for col in self._col_list}
+        names = self._col_names
+        out = []
+        for i in range(self._row_count):
+            if first_nullmask[i]:
+                continue
+            row = {name: mat[name][i] for name in names}
+            if predicate(row):
+                out.append(i)
+        return out
+
+    def batch_update(self, predicate: Callable[[Dict[str, Any]], bool],
+                     updates: Dict[str, Any]) -> int:
+        """Column-wise batch update without materializing each full row twice."""
+        for name in updates:
+            if name not in self.columns:
+                raise ValueError(f"Unknown column: {name}")
+        matches = self._matching_indices(predicate)
+        for name, value in updates.items():
+            col = self.columns[name]
+            for idx in matches:
+                col[idx] = value
+        return len(matches)
+
+    def group_by(self, key_column: str, value_column: str, agg: str = "count") -> Dict[Any, Any]:
+        """Columnar grouped aggregate using only the two participating columns."""
+        if key_column not in self.columns:
+            raise ValueError(f"Unknown column: {key_column}")
+        if value_column not in self.columns:
+            raise ValueError(f"Unknown column: {value_column}")
+
+        keys = self.columns[key_column].tolist()
+        vals = self.columns[value_column].tolist()
+        live = self._col_list[0]._nullmask
+        groups: Dict[Any, Any] = {}
+        counts: Dict[Any, int] = {}
+
+        for i in range(self._row_count):
+            if live[i]:
+                continue
+            key = keys[i]
+            val = vals[i]
+            if val is None:
+                continue
+            if agg == "count":
+                groups[key] = groups.get(key, 0) + 1
+            elif agg == "sum":
+                groups[key] = groups.get(key, 0) + val
+            elif agg == "avg":
+                groups[key] = groups.get(key, 0) + val
+                counts[key] = counts.get(key, 0) + 1
+            elif agg == "min":
+                groups[key] = val if key not in groups or val < groups[key] else groups[key]
+            elif agg == "max":
+                groups[key] = val if key not in groups or val > groups[key] else groups[key]
+            else:
+                raise ValueError(f"Unsupported aggregate: {agg}")
+
+        if agg == "avg":
+            return {key: total / counts[key] for key, total in groups.items()}
+        return groups
+
     def select(self,
                where: Optional[Callable[[Dict[str, Any]], bool]] = None,
                columns: Optional[List[str]] = None,
