@@ -43,7 +43,8 @@ pip install pysnapdb
 - **Delta encoding** — base + deltas for monotonic columns (timestamps, IDs) (v0.5.0)
 - **Bit-packed booleans** — Python `int` bitmask: ~8× smaller than `array('b')`
 - **Hash index** — `create_index()` / `lookup()` / `find()`, **kept in sync** on every insert / update / delete
-- **Durable writes** — write-ahead log with real transaction rollback; CDC stream; Prometheus-style metrics
+- **Durability safeguards** — row-store transactions log row data to a replayed WAL; committed transactions recover after abrupt process exit
+- **Operational safety** — per-file advisory locks, explicit `backup()` and `compact()`, optional at-rest encryption, CDC stream, Prometheus-style metrics
 - **Zero dependencies** — stdlib only (NumPy is optional, only for zero-copy export)
 
 ## Installation
@@ -106,8 +107,38 @@ db = SnapDB("data.snap", schema, metrics=Metrics())
 
 | Mode | Best For | Strengths |
 |------|---------|-----------|
-| `storage_type="columnar"` | OLAP / analytics | Fast full-scan aggregation (~59M rows/s), vectorized filters, column compression, lowest memory |
-| `storage_type="row"` | OLTP / full-row point access | Zero-copy `get_raw()`, WAL transactions, hash indexes, CDC |
+| `storage_type="columnar"` | OLAP / analytics | Fast full-scan aggregation (~59M rows/s), vectorized filters, column compression, lowest memory, snapshot persistence on close/backup |
+| `storage_type="row"` | OLTP / full-row point access | Zero-copy `get_raw()`, replayed WAL transactions, hash indexes, CDC, compaction |
+
+## Data Safety APIs
+
+```python
+schema = Schema([
+    ColumnDef("id", "i32", primary_key=True),       # primary_key => unique + not_null
+    ColumnDef("email", "bytes:64", unique=True),
+    ColumnDef("score", "f32"),
+])
+
+db = SnapDB("users.snap", schema, encryption_key="optional-secret")
+
+with db.transaction():
+    db.insert({"id": 1, "email": "alice@test.com", "score": 100.0})
+
+# Consistent hot backup: flushes/snapshots before copying.
+db.backup("users.backup.snap")
+
+# Reclaim deleted row space in the row store.
+reclaimed_bytes = db.compact()
+
+# Lightweight integrity report and best-effort metadata repair.
+report = db.fsck()
+repair_report = db.repair()
+```
+
+- Missing required columns and `None` values fail before encoding.
+- `unique=True` and `primary_key=True` are enforced on insert, batch insert, update, reopen, and WAL recovery.
+- A database file cannot be opened twice for writing in one process, and supported platforms use an advisory sidecar lock to reject concurrent writer processes.
+- `encryption_key` encrypts row payloads, columnar snapshots, and WAL records at rest. It is intended to prevent casual raw-file secret recovery for embedded deployments; it is not a replacement for OS key management or a full RBAC/auth system.
 
 See [Benchmarks](#benchmarks) for measured throughput and memory.
 
@@ -225,6 +256,19 @@ db.select_where({"status": b"active", "age": {"gte": 21}})
 
 # fast filtered count — no rows materialized (NumPy-accelerated)
 db.count_where([("age", ">", 30), ("temp", "<", 35.0)])
+```
+
+## Batch Updates, Grouping, and Joins
+
+```python
+# Update many rows without hand-written per-row loops.
+db.batch_update(lambda row: row["score"] < 50, {"active": False})
+
+# Small grouped aggregates.
+totals = db.group_by("country", "score", "sum")
+
+# In-memory equi-join between two SnapDB instances.
+pairs = users.join(departments, "dept_id", "id")
 ```
 
 ## Auto-Indexing (v0.6.0)
@@ -359,6 +403,15 @@ on Linux (3.9–3.13) and Windows, and the benchmark on every push and PR.
 
 ## Version History
 
+- **v0.12.0** — Production-readiness hardening:
+  - Row-store transactions now append row-level WAL records and replay committed transactions on open, so committed transactional writes recover after abrupt process exit
+  - `close()` inside an open transaction rolls back instead of committing partial work; nested transactions now fail loudly
+  - Per-instance `RLock`, same-process double-open guard, and cross-process advisory sidecar lock prevent the demonstrated write races/corruption
+  - `ColumnDef(unique=True)` and `ColumnDef(primary_key=True)` enforce uniqueness; missing required columns and `None` values fail before binary encoding
+  - Columnar `SnapDB(..., storage_type="columnar")` persists snapshots to the provided path; `backup()` flushes/snapshots before copying; `compact()` reclaims deleted row space; `fsck()`/`repair()` provide lightweight integrity tooling
+  - `limit <= 0` returns no rows consistently; `batch_update()`, `group_by()`, and in-memory equi-`join()` added
+  - Optional `encryption_key` encrypts row payloads, columnar snapshots, and WAL records at rest
+  - DocumentStore JSON export/import preserves list/dict fields instead of stringifying Python reprs
 - **v0.11.0** — NumPy-accelerated string filtering:
   - `select_where()`/`count_where()` on **dict-encoded** string columns compare integer dict codes via NumPy for `eq`/`ne`/`in` instead of per-row string comparison — **~300×+** faster (dict `==` count ~969M rows/s); a mixed numeric+string filtered count now runs ~143× faster. Exact parity verified; ordering ops and non-dict bytes columns keep the Python path
 - **v0.10.0** — Fast row-store bulk insert ([#13](https://github.com/hussain-alsaibai/snapdb/issues/13)):
@@ -396,11 +449,12 @@ on Linux (3.9–3.13) and Windows, and the benchmark on every push and PR.
 
 ## Roadmap & Known Limitations
 
-Tracked as GitHub issues:
+Current known limitations:
 
-- [#11](https://github.com/hussain-alsaibai/snapdb/issues/11) — Frame-of-Reference (FOR) encoding for bounded numeric ranges
-- [#12](https://github.com/hussain-alsaibai/snapdb/issues/12) — Low-overhead query profiler via `sys.monitoring` (PEP 669)
-- [#14](https://github.com/hussain-alsaibai/snapdb/issues/14) — Optional NumPy-accelerated filters & aggregates (keeping the zero-dependency default)
+- SnapDB is embedded and local-file based. It does not provide server authentication, RBAC, network encryption, ODBC/JDBC/ADBC, or a SQLAlchemy dialect.
+- Joins are in-memory equi-joins, not a SQL optimizer.
+- The optional `encryption_key` protects raw files/WAL from casual plaintext recovery, but production deployments should still rely on OS permissions, key management, and encrypted volumes.
+- Multi-version snapshot isolation is not implemented; the file lock model is single-writer oriented.
 
 ## License
 

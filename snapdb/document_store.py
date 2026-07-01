@@ -75,8 +75,10 @@ class DocumentStore:
             elif dtype.startswith("bytes"):
                 if isinstance(val, bytes):
                     result[key] = val
+                elif isinstance(val, str):
+                    result[key] = val.encode("utf-8")
                 else:
-                    result[key] = str(val).encode("utf-8")
+                    result[key] = json.dumps(val).encode("utf-8")
             else:
                 result[key] = val
         return result
@@ -94,6 +96,11 @@ class DocumentStore:
                         result[key] = val.decode("utf-8").rstrip("\x00")
                     except UnicodeDecodeError:
                         result[key] = val
+            elif isinstance(val, str):
+                try:
+                    result[key] = json.loads(val)
+                except json.JSONDecodeError:
+                    result[key] = val
             else:
                 result[key] = val
         return result
@@ -160,6 +167,8 @@ class DocumentStore:
         """
         if self._db is None:
             return []
+        if limit is not None and limit <= 0:
+            return []
 
         # Build predicate from filter_spec
         if filter_spec:
@@ -174,7 +183,7 @@ class DocumentStore:
 
         # Slice
         start = offset
-        end = start + limit if limit else len(rows)
+        end = start + limit if limit is not None else len(rows)
         rows = rows[start:end]
 
         # Select fields

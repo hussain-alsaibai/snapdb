@@ -868,6 +868,9 @@ class ColumnarTable:
                columns: Optional[List[str]] = None,
                limit: Optional[int] = None,
                offset: int = 0) -> List[Dict[str, Any]]:
+        if limit is not None and limit <= 0:
+            return []
+
         if columns is None:
             col_names = self._col_names
         else:

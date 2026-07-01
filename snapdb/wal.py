@@ -15,8 +15,31 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Union
+
+
+def _derive_key(key: Union[str, bytes, None]) -> Optional[bytes]:
+    if key is None:
+        return None
+    raw = key.encode("utf-8") if isinstance(key, str) else bytes(key)
+    return hashlib.sha256(raw).digest()
+
+
+def _xor_stream(key: bytes, nonce: bytes, data: bytes) -> bytes:
+    out = bytearray(len(data))
+    pos = 0
+    counter = 0
+    while pos < len(data):
+        block = hashlib.sha256(key + nonce + counter.to_bytes(8, "little")).digest()
+        for b in block:
+            if pos >= len(data):
+                break
+            out[pos] = data[pos] ^ b
+            pos += 1
+        counter += 1
+    return bytes(out)
 
 
 class WAL:
@@ -29,13 +52,14 @@ class WAL:
         wal.checkpoint()  # replay and clear
     """
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, encryption_key: Union[str, bytes, None] = None) -> None:
         self.path = Path(path)
         self._file: Optional[Any] = None
         self._buffer: List[Dict] = []
         self._buffer_size = 100
         self._txid = 0
         self._in_tx = False
+        self._key = _derive_key(encryption_key)
 
     def _open(self) -> None:
         if self._file is None:
@@ -63,7 +87,15 @@ class WAL:
             return
         self._open()
         for record in self._buffer:
-            self._file.write(json.dumps(record, separators=(",", ":")) + "\n")
+            payload = json.dumps(record, separators=(",", ":")).encode("utf-8")
+            if self._key is not None:
+                nonce = os.urandom(16)
+                payload = json.dumps({
+                    "enc": True,
+                    "nonce": nonce.hex(),
+                    "data": _xor_stream(self._key, nonce, payload).hex(),
+                }, separators=(",", ":")).encode("utf-8")
+            self._file.write(payload.decode("utf-8") + "\n")
         self._file.flush()
         os.fsync(self._file.fileno())
         self._buffer.clear()
@@ -94,11 +126,28 @@ class WAL:
         self._flush()
         if not self.path.exists():
             return
+
+        def _decode(val):
+            if isinstance(val, dict):
+                if set(val) == {"__bytes__"}:
+                    return bytes.fromhex(val["__bytes__"])
+                return {k: _decode(v) for k, v in val.items()}
+            if isinstance(val, list):
+                return [_decode(v) for v in val]
+            return val
+
         with open(self.path, "r") as f:
             for line in f:
                 line = line.strip()
                 if line:
-                    yield json.loads(line)
+                    record = json.loads(line)
+                    if isinstance(record, dict) and record.get("enc"):
+                        if self._key is None:
+                            raise ValueError("WAL is encrypted; pass encryption_key to replay it")
+                        nonce = bytes.fromhex(record["nonce"])
+                        data = bytes.fromhex(record["data"])
+                        record = json.loads(_xor_stream(self._key, nonce, data).decode("utf-8"))
+                    yield _decode(record)
 
     def clear(self) -> None:
         """Clear the WAL after successful checkpoint."""

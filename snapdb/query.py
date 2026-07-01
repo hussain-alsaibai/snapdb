@@ -76,6 +76,9 @@ class Query:
 
     def execute(self) -> List[Tuple[int, Dict[str, Any]]]:
         """Run the query and return (idx, row) results."""
+        if self.limit is not None and self.limit <= 0:
+            return []
+
         # 1. Filter
         if self.where:
             rows = [(idx, row) for idx, row in self.db if self.where(row)]
@@ -89,7 +92,7 @@ class Query:
 
         # 3. Slice
         start = self.offset
-        end = start + self.limit if self.limit else len(rows)
+        end = start + self.limit if self.limit is not None else len(rows)
         return rows[start:end]
 
     def first(self) -> Optional[Tuple[int, Dict[str, Any]]]:
