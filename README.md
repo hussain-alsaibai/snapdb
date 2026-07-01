@@ -3,7 +3,7 @@
 **Extremely Lightweight, Lightning-Fast In-Memory Database for Python**
 
 [![CI](https://github.com/hussain-alsaibai/snapdb/actions/workflows/ci.yml/badge.svg)](https://github.com/hussain-alsaibai/snapdb/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/snapdb.svg)](https://pypi.org/project/snapdb/)
+[![PyPI](https://img.shields.io/pypi/v/pysnapdb.svg)](https://pypi.org/project/pysnapdb/)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
@@ -12,7 +12,7 @@ engine and a row store, memory-mapped files, lightweight column compression, and
 precompiled struct codecs — built for **maximum speed at minimum memory**.
 
 ```bash
-pip install snapdb
+pip install pysnapdb
 ```
 
 ## Contents
@@ -49,8 +49,11 @@ pip install snapdb
 ## Installation
 
 ```bash
-pip install snapdb
+pip install pysnapdb
 ```
+
+The PyPI distribution is named `pysnapdb` (`snapdb` was already taken), but the
+import name is unchanged: `import snapdb`.
 
 Or from source:
 ```bash
