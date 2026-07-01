@@ -294,7 +294,8 @@ class DuckDBEngine(Engine):
         self._df = pd.DataFrame(rows) if pd is not None else None
         if self._df is not None:
             self._df["status"] = self._df["status"].str.decode("utf-8")
-            self.con.execute("CREATE TABLE t AS SELECT * FROM _df", {"_df": self._df})
+            self.con.register("_df_view", self._df)
+            self.con.execute("CREATE TABLE t AS SELECT * FROM _df_view")
         else:
             self.available = False
 

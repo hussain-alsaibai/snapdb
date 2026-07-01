@@ -42,3 +42,4 @@ env/
 *.swp
 .DS_Store
 Thumbs.db
+evaluation.txt
