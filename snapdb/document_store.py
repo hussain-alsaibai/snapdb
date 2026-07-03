@@ -75,9 +75,10 @@ class DocumentStore:
             elif dtype.startswith("bytes"):
                 if isinstance(val, bytes):
                     result[key] = val
-                elif isinstance(val, str):
-                    result[key] = val.encode("utf-8")
                 else:
+                    # JSON-encode strings too (not just complex values) so
+                    # _decode round-trips types exactly: a stored "2134" must
+                    # come back as the string "2134", not the int 2134.
                     result[key] = json.dumps(val).encode("utf-8")
             else:
                 result[key] = val
@@ -106,15 +107,16 @@ class DocumentStore:
         return result
 
     def _load(self) -> None:
-        """Load existing document store."""
-        # For now, just create with a basic schema and load
-        # In v0.3.1: store schema metadata in the file header
+        """Load an existing document store.
+
+        The placeholder schema passed here is replaced by the real schema
+        persisted in the file header (SnapDB._load restores it), so the field
+        map must be rebuilt from the loaded schema — without it, _coerce()
+        returns empty rows and every insert/update after a reopen fails.
+        """
         schema = Schema([ColumnDef("__json", f"bytes:{self.max_field_len * 4}")])
-        try:
-            self._db = SnapDB(self.path, schema)
-        except (ValueError, OSError):
-            # File exists but is empty or corrupted — start fresh
-            self._db = None
+        self._db = SnapDB(self.path, schema)
+        self._field_types = {c.name: c.dtype for c in self._db.schema.columns}
 
     def insert(self, doc: Dict[str, Any]) -> int:
         """Insert a document. Returns row index."""
@@ -170,10 +172,13 @@ class DocumentStore:
         if limit is not None and limit <= 0:
             return []
 
-        # Build predicate from filter_spec
+        # Build predicate from filter_spec. Filter on the DECODED document —
+        # raw rows hold JSON-encoded strings, so comparisons against them
+        # would never match the caller's values.
         if filter_spec:
             pred = self._build_predicate(filter_spec)
-            rows = [(idx, self._decode(row)) for idx, row in self._db if pred(row)]
+            rows = [(idx, doc) for idx, row in self._db
+                    if pred(doc := self._decode(row))]
         else:
             rows = [(idx, self._decode(row)) for idx, row in self._db]
 
@@ -225,6 +230,10 @@ class DocumentStore:
                         checks.append(lambda r, k=key, v=cmp_val: v in str(r.get(k, "")))
                     elif op == "$exists":
                         checks.append(lambda r, k=key: k in r)
+                    else:
+                        # A silently-ignored unknown operator would make the
+                        # condition match everything (filter bypass).
+                        raise ValueError(f"Unsupported operator: {op!r}")
             else:
                 # Exact match
                 checks.append(lambda r, k=key, v=val: r.get(k) == v)

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import time
 import threading
-from typing import Dict, List, Optional
+from typing import Dict, List
 from collections import defaultdict
 
 
@@ -40,14 +40,6 @@ class Metrics:
     def add_latency(self, metric: str, seconds: float) -> None:
         with self._lock:
             self._latencies[metric].append(seconds)
-
-    def _snapshot(self) -> Dict[str, int]:
-        with self._lock:
-            return dict(self._counters)
-
-    def _latency_snapshot(self) -> Dict[str, List[float]]:
-        with self._lock:
-            return {k: v.copy() for k, v in self._latencies.items()}
 
     def report(self) -> str:
         """Return a Prometheus-like text report."""
@@ -109,20 +101,6 @@ class Metrics:
             self._start_time = self._now()
             self._last_report_time = self._start_time
             self._last_report_counts.clear()
-
-
-# Decorator to time a method and record latency
-def timeit(metrics: Optional[Metrics], metric_name: str):
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            start = time.time()
-            try:
-                return func(*args, **kwargs)
-            finally:
-                if metrics is not None:
-                    metrics.add_latency(metric_name, time.time() - start)
-        return wrapper
-    return decorator
 
 
 if __name__ == "__main__":

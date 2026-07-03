@@ -15,31 +15,10 @@ from __future__ import annotations
 
 import json
 import os
-import hashlib
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Union
 
-
-def _derive_key(key: Union[str, bytes, None]) -> Optional[bytes]:
-    if key is None:
-        return None
-    raw = key.encode("utf-8") if isinstance(key, str) else bytes(key)
-    return hashlib.sha256(raw).digest()
-
-
-def _xor_stream(key: bytes, nonce: bytes, data: bytes) -> bytes:
-    out = bytearray(len(data))
-    pos = 0
-    counter = 0
-    while pos < len(data):
-        block = hashlib.sha256(key + nonce + counter.to_bytes(8, "little")).digest()
-        for b in block:
-            if pos >= len(data):
-                break
-            out[pos] = data[pos] ^ b
-            pos += 1
-        counter += 1
-    return bytes(out)
+from ._util import _derive_key, _xor_stream
 
 
 class WAL:
@@ -139,15 +118,26 @@ class WAL:
         with open(self.path, "r") as f:
             for line in f:
                 line = line.strip()
-                if line:
+                if not line:
+                    continue
+                try:
                     record = json.loads(line)
-                    if isinstance(record, dict) and record.get("enc"):
-                        if self._key is None:
-                            raise ValueError("WAL is encrypted; pass encryption_key to replay it")
+                except json.JSONDecodeError:
+                    # Torn/partial trailing record from a crash mid-append.
+                    # Everything before it is intact and already yielded;
+                    # stop here instead of making the database unopenable.
+                    break
+                if isinstance(record, dict) and record.get("enc"):
+                    if self._key is None:
+                        raise ValueError("WAL is encrypted; pass encryption_key to replay it")
+                    try:
                         nonce = bytes.fromhex(record["nonce"])
                         data = bytes.fromhex(record["data"])
                         record = json.loads(_xor_stream(self._key, nonce, data).decode("utf-8"))
-                    yield _decode(record)
+                    except (json.JSONDecodeError, KeyError, ValueError):
+                        # Torn encrypted record (or truncated hex) — same as above.
+                        break
+                yield _decode(record)
 
     def clear(self) -> None:
         """Clear the WAL after successful checkpoint."""

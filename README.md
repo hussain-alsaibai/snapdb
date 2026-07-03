@@ -1,20 +1,20 @@
 # SnapDB
 
-**Extremely Lightweight, Lightning-Fast In-Memory Database for Python**
+A lightweight, pure-Python embedded database with a row store and a columnar
+analytics engine.
 
 [![CI](https://github.com/hussain-alsaibai/snapdb/actions/workflows/ci.yml/badge.svg)](https://github.com/hussain-alsaibai/snapdb/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/pysnapdb.svg)](https://pypi.org/project/pysnapdb/)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-A **zero-dependency, pure-Python** embedded database for **single-writer, local Python
-applications**. Columnar analytics engine, row store, memory-mapped files, lightweight
-column compression, and precompiled struct codecs — built for **maximum speed at minimum
-memory** within a minimal-dependency footprint.
-
-> **Niche:** compact test fixtures, small operational datasets, embedded Python tools,
-> and NumPy-friendly analytical helpers where pulling in SQLite or a heavy binary
-> extension is undesirable. SnapDB is intentionally *not* a SQLite or DuckDB replacement.
+SnapDB is a zero-dependency embedded database for single-writer, local Python
+applications. It stores data in memory-mapped files with precompiled struct
+codecs and lightweight column compression, and targets use cases such as test
+fixtures, small operational datasets, and embedded analytics where pulling in
+SQLite or a compiled extension isn't worth it. It is not a drop-in replacement
+for SQLite or DuckDB — see [Roadmap & Known Limitations](#roadmap--known-limitations)
+for the design boundaries.
 
 ```bash
 pip install pysnapdb
@@ -22,7 +22,7 @@ pip install pysnapdb
 
 ## Contents
 
-- [Key Innovations](#key-innovations)
+- [Features](#features)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Storage Modes](#storage-modes)
@@ -34,24 +34,24 @@ pip install pysnapdb
 - [Roadmap & Known Limitations](#roadmap--known-limitations)
 - [License](#license)
 
-## Key Innovations
+## Features
 
-- **Columnar engine** — column-oriented per-column `array.array` storage; full-scan aggregation **~27× faster than SQLite** at a fraction of the memory
-- **NumPy-accelerated aggregates** *(optional, v0.8.0)* — when NumPy is installed, `aggregate()` runs over the zero-copy column buffer (**~530M rows/s**, on par with pandas); pure-Python remains the zero-dependency default
-- **NumPy-accelerated filters** *(optional, v0.9.0)* — `select_where()` builds masks vectorially; `count_where()` (filtered count, no row materialization) hits **~314M rows/s** on numeric predicates (~166× the pure-Python path)
-- **Lowest memory footprint of the field** — ~2.2 MB / 100K rows vs SQLite 2.9 MB, pandas 11 MB, plain `dict` 22 MB ([benchmarks](#benchmarks))
-- **Vectorized multi-condition filters** *(v0.6.0)* — `select_where()` combines per-column bitmasks with C-speed big-integer `AND`/`OR` (**~2× faster** selective `WHERE`)
-- **O(1) delta-encoded reads** *(v0.6.0)* — lazy reconstruction cache turns delta scans from O(n²) into O(n) (orders of magnitude faster)
+- **Columnar engine** — column-oriented `array.array` storage; full-scan aggregation runs ~27× faster than SQLite at a fraction of the memory
+- **NumPy-accelerated aggregates** *(optional, v0.8.0)* — when NumPy is installed, `aggregate()` runs over the zero-copy column buffer (~530M rows/s, on par with pandas); pure-Python remains the zero-dependency default
+- **NumPy-accelerated filters** *(optional, v0.9.0)* — `select_where()` builds masks vectorially; `count_where()` (filtered count, no row materialization) reaches ~314M rows/s on numeric predicates (~166× the pure-Python path)
+- **Low memory footprint** — ~2.2 MB / 100K rows vs. 2.9 MB for SQLite, 11 MB for pandas, 22 MB for a plain `dict` ([benchmarks](#benchmarks))
+- **Vectorized multi-condition filters** *(v0.6.0)* — `select_where()` combines per-column bitmasks with big-integer `AND`/`OR` (~2× faster on selective `WHERE` clauses)
+- **O(1) delta-encoded reads** *(v0.6.0)* — a lazy reconstruction cache turns delta scans from O(n²) into O(n)
 - **Auto-indexing** *(v0.6.0)* — `auto_index=True` builds a hash index for a column once it's queried often enough
 - **Zero-copy NumPy export** *(v0.6.0)* — `to_numpy()` / `buffer()` (PEP 688) share raw column memory with NumPy without copying
-- **Dictionary encoding** — transparent per-column dictionary for low-cardinality strings: **~3× memory reduction** (v0.4.0)
-- **Delta encoding** — base + deltas for monotonic columns (timestamps, IDs) (v0.5.0)
-- **Bit-packed booleans** — Python `int` bitmask: ~8× smaller than `array('b')`
-- **Hash index** — `create_index()` / `lookup()` / `find()`, **kept in sync** on every insert / update / delete
-- **Range index** — `create_range_index()` / `range_find()` for ordered numeric windows without adding a B-tree dependency
-- **Durability safeguards** — row-store transactions log row data to a replayed WAL; committed transactions recover after abrupt process exit
-- **Operational safety** — per-file advisory locks, explicit `backup()` and `compact()`, optional at-rest encryption, CDC stream, Prometheus-style metrics
-- **Zero dependencies** — stdlib only (NumPy is optional, only for zero-copy export)
+- **Dictionary encoding** *(v0.4.0)* — transparent per-column dictionary for low-cardinality strings, ~3× memory reduction
+- **Delta encoding** *(v0.5.0)* — base + deltas for monotonic columns (timestamps, IDs)
+- **Bit-packed booleans** — Python `int` bitmask, ~8× smaller than `array('b')`
+- **Hash index** — `create_index()` / `lookup()` / `find()`, kept in sync on every insert, update, and delete
+- **Range index** — `create_range_index()` / `range_find()` for ordered numeric windows without a B-tree dependency
+- **Durability** — row-store transactions log row data to a replayed WAL; committed transactions recover after an abrupt process exit
+- **Operational tooling** — per-file advisory locks, `backup()`, `compact()`, optional at-rest encryption, a CDC stream, and Prometheus-style metrics
+- **Zero dependencies** — stdlib only; NumPy is optional and only used for zero-copy export
 
 ## Installation
 
@@ -133,6 +133,13 @@ with db.transaction():
 # Consistent hot backup: flushes/snapshots before copying.
 db.backup("users.backup.snap")
 
+# Named, restorable point-in-time snapshots (v1: full copy under the hood,
+# not copy-on-write — see Roadmap).
+db.snapshot("before-migration")
+db.list_snapshots()
+old = db.open_snapshot("before-migration")  # independent, read-friendly copy
+old.close()
+
 # Reclaim deleted row space in the row store.
 reclaimed_bytes = db.compact()
 
@@ -145,6 +152,7 @@ repair_report = db.repair()
 - `unique=True` and `primary_key=True` are enforced on insert, batch insert, update, reopen, and WAL recovery.
 - A database file cannot be opened twice for writing in one process, and supported platforms use an advisory sidecar lock to reject concurrent writer processes.
 - `encryption_key` encrypts row payloads, columnar snapshots, and WAL records at rest. It is intended to prevent casual raw-file secret recovery for embedded deployments; it is not a replacement for OS key management or a full RBAC/auth system.
+- `snapshot()`/`open_snapshot()`/`list_snapshots()`/`drop_snapshot()` give named, restorable history. Each snapshot is a full flush + file copy (same cost as `backup()`), tracked in a small JSON manifest next to the database file — not copy-on-write, so it isn't O(1) and there's no diff-between-snapshots. Opening a snapshot returns an independent `SnapDB`; writes to it never affect the live database.
 
 See [Benchmarks](#benchmarks) for measured throughput and memory.
 
@@ -339,18 +347,18 @@ _100,000 rows · 50,000 point reads · best of 5 · Python 3.13 · win32 (NumPy 
 | Memory footprint | MB | 2.2 | n/a | 2.9 | 11.0 | 22.5 |
 <!-- BENCH:END -->
 
-**Where SnapDB wins (honestly):**
+**Strengths:**
 
-- **Memory** — the columnar store is the **lightest** here: ~5× smaller than pandas and ~10× smaller than a plain `dict`, with zero dependencies.
-- **Full-scan aggregation** — **on par with pandas (~530M rows/s)** and ~27× faster than in-memory SQLite. With NumPy installed, `aggregate()` runs over the zero-copy column buffer (issue #14); without NumPy the pure-Python path still does ~58M rows/s (~3× SQLite).
+- **Memory** — the columnar store is the lightest here: ~5× smaller than pandas and ~10× smaller than a plain `dict`, with zero dependencies.
+- **Full-scan aggregation** — on par with pandas (~530M rows/s) and ~27× faster than in-memory SQLite. With NumPy installed, `aggregate()` runs over the zero-copy column buffer (issue #14); without NumPy the pure-Python path still does ~58M rows/s (~3× SQLite).
 - **Embeddable** — a single mmap-backed file, no server, no C extensions.
 
-**Where it doesn't (also honestly):** SQLite still wins on ACID semantics,
-SQL coverage, B-tree point reads, migrations, and ecosystem integration.
-DuckDB still wins on analytical SQL, joins, vectorized scans, and Parquet/Arrow
-workloads. Both win on multi-condition filter throughput. SnapDB's value is the
-zero-dependency footprint, direct Python dict/row APIs, and the columnar memory
-efficiency — not replacing either engine.
+**Trade-offs:** SQLite has broader SQL coverage, B-tree point reads,
+migrations tooling, and a larger ecosystem. DuckDB has a full analytical SQL
+engine, joins, vectorized scans, and Parquet/Arrow integration. Both beat
+SnapDB on multi-condition filter throughput. SnapDB's advantages are the
+zero-dependency footprint, direct Python dict/row APIs, and columnar memory
+efficiency — it isn't meant to replace either engine.
 
 > CI runs this suite on every push and publishes a fresh table to the workflow
 > run summary (Actions → CI → Benchmark).
@@ -414,13 +422,30 @@ on Linux (3.9–3.13) and Windows, and the benchmark on every push and PR.
 
 ## Version History
 
+- **v0.14.0** — Correctness fixes, speed pass, and named snapshots:
+  - **Correctness** — several real bugs fixed and locked in with tests:
+    - The WAL sidecar path is now derived by suffix (`Path.with_suffix`) instead of `str.replace(".snap", ".wal")`; a database path without `.snap` (e.g. `data.db`) no longer aliases the WAL onto the database file itself (which could append log records into — or delete — the live file)
+    - `DocumentStore` rebuilds its inferred field map on reopen, so inserts/updates work after a restart instead of raising `KeyError`; string fields are JSON-encoded so numeric-looking strings (`"02134"`) round-trip as strings, and unknown query operators raise instead of silently matching everything
+    - Torn/partial trailing WAL records from an abrupt exit are tolerated on replay instead of making the database unopenable
+    - Negative row indices are rejected in `get`/`get_raw`/`update`/`delete` instead of silently addressing the last slab
+    - Columnar scans/aggregates no longer treat a legitimately-null first column as a deleted row; `aggregate(..., "count", where=...)` now honors the predicate; delta encoding handles values beyond `i32`/`i64` deltas (including negative deltas on unsigned columns) by widening or falling back to raw storage
+    - `batch_insert` emits CDC events and returns the inserted-row count consistently for both storage engines; a failed open no longer leaks the in-process file lock
+  - **Speed** (measured against the pre-change code):
+    - Opening a file uses `bytearray.count(1)` for the live-row popcount instead of a Python loop — **~73×** faster open on a 300K-row file
+    - `range_find` prunes whole slabs via per-slab min/max zone maps (built lazily on first use); a warm narrow range query is **~220×** faster
+    - Delta/Frame-of-Reference aggregates reduce a cached reconstruction with C-level `sum`/`min`/`max` instead of a Python generator — **~14×** on repeated delta sums
+    - `Query.filter` compiles conditions into a single evaluated predicate (values passed via namespace, never interpolated — no injection surface) — **~2.6×** on the predicate itself
+    - Full slab scans batch-decode via `struct.iter_unpack`; bool columns use a mutable `bytearray` bitset (O(1) append instead of O(n) big-int copy); the NumPy filter paths keep a C-level vectorized liveness mask
+  - **Named snapshots** — `snapshot()`, `list_snapshots()`, `open_snapshot()`, `drop_snapshot()` provide restorable, point-in-time history via a JSON manifest beside the database file. This v1 is a full flush + copy (not copy-on-write, not O(1)); opening a snapshot returns an independent `SnapDB` whose writes never touch the live database
+  - **Internal** — shared dtype tables, query-value normalization, and the XOR-stream cipher consolidated into `snapdb/_util.py` (previously duplicated across `core`/`columnar`/`index`/`wal`), removing drift risk
+
 - **v0.13.0** — Speed, lightweight, and reliability micro-pass:
   - `_xor_stream` now XORs full 32-byte SHA-256 blocks with a single 256-bit integer operation instead of a 32-iteration Python byte loop — significantly faster for encrypted row/WAL/blob operations
   - `Schema.decode_row()` accepts `memoryview` directly without an intermediate `bytes()` copy, reducing per-row allocations on every read path
   - `Slab.iter_rows()` inlines the hot read path to avoid redundant per-row bounds and liveness checks
-  - README and roadmap updated to reflect honest niche positioning per re-evaluation (single-writer embedded Python database; not a SQLite or DuckDB replacement)
+  - README and roadmap updated to describe SnapDB as a single-writer embedded Python database, not a SQLite or DuckDB replacement
 
-- **v0.12.1** — Niche performance gap closing:
+- **v0.12.1** — Performance improvements:
   - Added stdlib-only sorted range indexes for row-store ordered lookups (`create_range_index()` / `range_find()`), kept in sync across insert/update/delete/compact
   - Columnar `batch_update()` and `group_by()` now use column-oriented helpers when constraints/index/CDC hooks do not require the generic row path
 - **v0.12.0** — Production-readiness hardening:
@@ -452,7 +477,7 @@ on Linux (3.9–3.13) and Windows, and the benchmark on every push and PR.
 - **v0.6.0** — Performance, correctness & features:
   - **New:** vectorized multi-condition `select_where()` (bitmask `AND`/`OR`), auto-indexing (`auto_index=True`), zero-copy NumPy export (`to_numpy()`/`buffer()`, PEP 688)
   - Delta-encoded column reads are now **O(1)/O(n)** (lazy reconstruction cache) instead of **O(n)/O(n²)** — orders of magnitude faster delta scans/aggregates
-  - Hash indexes are genuinely **kept in sync** on insert / `batch_insert` / update / delete (previously went stale after the first build); single unified `create_index()` for row **and** columnar storage; `find()` gained a scan fallback
+  - Hash indexes are kept in sync on insert, `batch_insert`, update, and delete (previously went stale after the first build); unified `create_index()` for both row and columnar storage; `find()` gained a scan fallback
   - Fixed data corruption: deleting/nulling a delta-encoded row no longer shifts other rows' values
   - Transaction rollback now actually undoes writes (and restores indexes)
   - **Durability fix:** multi-slab row databases now survive `close()`/reopen — the on-disk bitmap geometry and slab high-water marks are persisted correctly (previously reopening a >1-slab database lost data)
@@ -480,13 +505,16 @@ The following are intentional non-goals; they will not be added:
 **Current limitations:**
 
 - The optional `encryption_key` protects raw files/WAL from casual plaintext recovery; it is not a substitute for OS key management or encrypted volumes.
-- Multi-version snapshot isolation is not implemented; the file lock model is single-writer oriented.
+- The file lock model is single-writer oriented; there is no concurrent-writer isolation.
+- `snapshot()` is a full flush + file copy, not copy-on-write — cost scales with database size, not with what changed since the last snapshot.
 
-**Near-term reliability focus** (per evaluation guidance):
+**Planned:**
 
-- Lightweight per-operation benchmarks with loose CI thresholds (insert / query / range / group-by timing and memory)
-- Additional `fsck`/`repair` fixtures for corruption recovery paths
-- Narrow helper improvements (batch paths, range windows, zero-copy buffers) only where they reduce per-row Python overhead without adding dependencies
+- Per-operation benchmarks with CI thresholds (insert / query / range / group-by timing and memory)
+- More `fsck`/`repair` fixtures covering corruption-recovery paths
+- Targeted helper improvements (batch paths, range windows, zero-copy buffers) where they reduce per-row overhead without adding dependencies
+- Copy-on-write snapshots (O(1), incremental) as a successor to the current full-copy `snapshot()`
+- Reactive queries (`db.watch(query, callback)`) driven off CDC events
 
 ## License
 

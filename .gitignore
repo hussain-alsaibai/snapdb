@@ -5,6 +5,9 @@
 *.bak
 *.backup
 
+# Design reasoning notes — kept locally for review, not published to the repo
+docs/design-notes.md
+
 # Secrets / local tooling — never commit
 github.token
 .claude/
