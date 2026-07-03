@@ -8,6 +8,8 @@ from __future__ import annotations
 import bisect
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from ._util import _norm_value
+
 
 class HashIndex:
     """In-memory hash index for a single column.
@@ -24,10 +26,9 @@ class HashIndex:
         self._total = 0
 
     def _key(self, value: Any) -> Any:
-        """Normalize key for hashing (handle bytes, etc)."""
-        if isinstance(value, bytes):
-            return value.decode("utf-8", errors="replace")
-        return value
+        """Normalize key for hashing — shared with core scans and columnar
+        filters (_util._norm_value) so all lookups compare identically."""
+        return _norm_value(value)
 
     def insert(self, row_idx: int, row: Dict[str, Any]) -> None:
         """Add a row to the index."""

@@ -16,7 +16,6 @@ License: MIT
 from __future__ import annotations
 
 import json
-import hashlib
 import mmap
 import os
 import pickle
@@ -27,7 +26,10 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Dict, Iterator, List, Optional, Tuple, Union
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+
+from ._util import (_type_size, _struct_code,
+                    _norm_value, _derive_key, _xor_stream)
 
 # v0.2.0 imports (optional)
 try:
@@ -52,43 +54,6 @@ except ImportError:
     Metrics = None  # type: ignore
 
 
-# ── Type Mapping ───────────────────────────────────────────────────────────────
-
-_TYPE_CODES: Dict[str, str] = {
-    "i8": "b", "i16": "h", "i32": "i", "i64": "q",
-    "u8": "B", "u16": "H", "u32": "I", "u64": "Q",
-    "f32": "f", "f64": "d",
-    "bool": "?",
-}
-
-_TYPE_SIZES: Dict[str, int] = {
-    "i8": 1, "i16": 2, "i32": 4, "i64": 8,
-    "u8": 1, "u16": 2, "u32": 4, "u64": 8,
-    "f32": 4, "f64": 8,
-    "bool": 1,
-}
-
-
-def _type_size(dtype: str) -> int:
-    if dtype.startswith("bytes"):
-        return int(dtype.split(":")[1])
-    return _TYPE_SIZES[dtype]
-
-
-def _struct_code(dtype: str) -> str:
-    if dtype.startswith("bytes"):
-        return f"{_type_size(dtype)}s"
-    return _TYPE_CODES[dtype]
-
-
-def _norm_value(value: Any) -> Any:
-    """Normalize a query value to match how rows decode (bytes -> str), so
-    scan-based lookups compare equal to indexed lookups (HashIndex._key)."""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return value
-
-
 # ── Header ─────────────────────────────────────────────────────────────────────
 
 _HEADER_FMT = "<4sHHIQ"
@@ -96,40 +61,6 @@ _HEADER_SIZE = struct.calcsize(_HEADER_FMT)
 _MAGIC = b"SNAP"
 _VERSION = 1
 _DEFAULT_PAGE_SIZE = 4096
-
-
-def _derive_key(key: Union[str, bytes, None]) -> Optional[bytes]:
-    if key is None:
-        return None
-    raw = key.encode("utf-8") if isinstance(key, str) else bytes(key)
-    return hashlib.sha256(raw).digest()
-
-
-def _xor_stream(key: bytes, nonce: bytes, data: bytes) -> bytes:
-    n = len(data)
-    if n == 0:
-        return data
-    parts: List[bytes] = []
-    pos = 0
-    counter = 0
-    while pos < n:
-        block = hashlib.sha256(key + nonce + counter.to_bytes(8, "little")).digest()
-        end = min(pos + 32, n)
-        chunk = end - pos
-        if chunk == 32:
-            # Fast path: single 256-bit integer XOR avoids a 32-iteration Python loop.
-            d_int = int.from_bytes(data[pos:end], "little")
-            k_int = int.from_bytes(block, "little")
-            parts.append((d_int ^ k_int).to_bytes(32, "little"))
-        else:
-            # Tail block (< 32 bytes).
-            arr = bytearray(data[pos:end])
-            for i in range(chunk):
-                arr[i] ^= block[i]
-            parts.append(bytes(arr))
-        pos = end
-        counter += 1
-    return b"".join(parts)
 
 
 def _pack_header(schema_offset: int, page_size: int = _DEFAULT_PAGE_SIZE) -> bytes:
@@ -178,16 +109,21 @@ class Schema:
 
     def _compile_format(self) -> None:
         """Precompute struct format string for batch pack/unpack."""
-        codes = []
-        for col in self.columns:
-            if col.dtype == "bool":
-                codes.append("?")
-            elif col.dtype.startswith("bytes"):
-                codes.append(f"{col.width}s")
-            else:
-                codes.append(_struct_code(col.dtype))
-        self._struct_fmt = "<" + "".join(codes)
+        self._struct_fmt = "<" + "".join(_struct_code(c.dtype) for c in self.columns)
         self._struct_size = struct.calcsize(self._struct_fmt)
+        # Precomputed for iter_unpack_rows: column names in order, and which
+        # positions need the bytes rstrip+decode step.
+        self._col_names_tuple = tuple(c.name for c in self.columns)
+        self._bytes_positions = tuple(i for i, c in enumerate(self.columns)
+                                      if c.dtype.startswith("bytes"))
+        # Columns eligible for per-slab zone maps (min/max pruning): ordered,
+        # comparable, fixed-width scalars. Bytes columns ARE lexically
+        # comparable but their zone-map value would be the decoded str (not
+        # the raw bytes), which range_find compares against; skip them to
+        # keep the maintenance cost predictable — numeric range queries are
+        # the overwhelmingly common case zone maps target.
+        self._zone_columns = tuple(c.name for c in self.columns
+                                   if not c.dtype.startswith("bytes") and c.dtype != "bool")
 
     @property
     def struct_fmt(self) -> str:
@@ -259,13 +195,34 @@ class Schema:
         unpacked = struct.unpack(self._struct_fmt, buf)
         row: Dict[str, Any] = {}
         for col, val in zip(self.columns, unpacked):
-            if col.dtype == "bool":
-                row[col.name] = val
-            elif col.dtype.startswith("bytes"):
+            if col.dtype.startswith("bytes"):
                 row[col.name] = val.rstrip(b"\x00").decode("utf-8", errors="replace")
             else:
                 row[col.name] = val
         return row
+
+    def iter_unpack_rows(self, buf: bytes) -> Iterator[Dict[str, Any]]:
+        """Batch-decode a contiguous buffer of whole rows.
+
+        struct.iter_unpack does the per-row unpacking in a single C-level call
+        sequence instead of N Python-level struct.unpack calls — the dominant
+        cost of a full scan. ``len(buf)`` must be an exact multiple of
+        ``struct_size`` (true for a slab's [0, count) byte range). Only used
+        for unencrypted slabs; encrypted rows are decrypted individually and
+        go through decode_row instead.
+        """
+        names = self._col_names_tuple
+        bytes_positions = self._bytes_positions
+        if not bytes_positions:
+            for unpacked in struct.iter_unpack(self._struct_fmt, buf):
+                yield dict(zip(names, unpacked))
+            return
+        for unpacked in struct.iter_unpack(self._struct_fmt, buf):
+            row: Dict[str, Any] = dict(zip(names, unpacked))
+            for pos in bytes_positions:
+                name = names[pos]
+                row[name] = row[name].rstrip(b"\x00").decode("utf-8", errors="replace")
+            yield row
 
 
 # ── Slab (Segment) ───────────────────────────────────────────────────────────
@@ -273,7 +230,8 @@ class Schema:
 class Slab:
     """Memory-mapped slab holding rows in a contiguous buffer."""
 
-    __slots__ = ("schema", "_mm", "_offset", "_capacity", "_count", "_live", "_crypt")
+    __slots__ = ("schema", "_mm", "_offset", "_capacity", "_count", "_live", "_crypt",
+                "_zone_min", "_zone_max", "_zone_built")
 
     def __init__(self, schema: Schema, mm: mmap.mmap, offset: int, capacity: int,
                  crypt: Optional[Callable[[bytes, int], bytes]] = None) -> None:
@@ -284,6 +242,17 @@ class Slab:
         self._count = 0
         self._live = bytearray(capacity)
         self._crypt = crypt
+        # Zone map (min/max per column) for range-query slab pruning. A
+        # freshly-constructed slab has no rows yet, so it starts "built" —
+        # every future row arrives through insert()/batch_insert(), which
+        # maintain it incrementally. A slab reconstructed by _load() from an
+        # existing file is different: it already has rows nothing here has
+        # seen, so the caller (SnapDB._load) marks it unbuilt; ensure_zone_map
+        # then does one lazy full scan on first use instead of paying that
+        # cost for every reopen regardless of whether range queries happen.
+        self._zone_min: Dict[str, Any] = {}
+        self._zone_max: Dict[str, Any] = {}
+        self._zone_built = True
 
     @property
     def offset(self) -> int:
@@ -321,6 +290,51 @@ class Slab:
         end = start + self.schema.row_width
         return memoryview(self._mm)[start:end]
 
+    def _zone_widen(self, row: Dict[str, Any]) -> None:
+        zmin, zmax = self._zone_min, self._zone_max
+        for name in self.schema._zone_columns:
+            v = row.get(name)
+            if v is None:
+                continue
+            cur_min = zmin.get(name)
+            if cur_min is None or v < cur_min:
+                zmin[name] = v
+            cur_max = zmax.get(name)
+            if cur_max is None or v > cur_max:
+                zmax[name] = v
+
+    def ensure_zone_map(self) -> None:
+        """Build the zone map if it hasn't been built yet (only true right
+        after a reload — see __init__). Deferred so opening a file stays
+        O(slabs) instead of O(rows); the first range query per slab pays a
+        one-time scan and every query after it (this session) is pruned."""
+        if self._zone_built:
+            return
+        if self._count > 0 and self.schema._zone_columns:
+            for _, row in self.iter_rows():
+                self._zone_widen(row)
+        self._zone_built = True
+
+    def zone_overlaps(self, column: str, low: Any, high: Any,
+                      include_low: bool = True, include_high: bool = True) -> bool:
+        """True if this slab's rows COULD contain a value in [low, high].
+
+        Conservative: bounds only ever widen (never shrink on delete/update),
+        so False means definitely no match; True means the caller must still
+        filter row-by-row. Missing zone info (unbuilt, or an all-null column)
+        also means True — safe default, just no pruning."""
+        zmin = self._zone_min.get(column)
+        zmax = self._zone_max.get(column)
+        if zmin is None or zmax is None:
+            return True
+        if high is not None:
+            if (zmin > high) if include_high else (zmin >= high):
+                return False
+        if low is not None:
+            if (zmax < low) if include_low else (zmax <= low):
+                return False
+        return True
+
     def insert(self, row: Dict[str, Any]) -> int:
         if self.is_full:
             raise RuntimeError("Slab is full")
@@ -333,6 +347,11 @@ class Slab:
             raw = self._crypt(raw, start)
         mv = memoryview(self._mm)[start : start + len(raw)]
         mv[:] = raw
+        # Only maintain incrementally once the map reflects everything prior
+        # (see ensure_zone_map) — otherwise this row's bounds would look
+        # authoritative while older, not-yet-scanned rows are excluded.
+        if self._zone_built and self.schema._zone_columns:
+            self._zone_widen(row)
         return idx
 
     def batch_insert(self, rows: List[Dict[str, Any]]) -> int:
@@ -348,12 +367,15 @@ class Slab:
         base_offset = self._row_offset(start_idx)
         # Encode all rows into a single buffer, then write in one shot
         buf = bytearray(len(rows) * row_width)
+        widen = self._zone_built and self.schema._zone_columns
         for i, row in enumerate(rows):
             raw = self.schema.encode_row(row)
             if self._crypt is not None:
                 raw = self._crypt(raw, base_offset + i * row_width)
             buf[i * row_width : (i + 1) * row_width] = raw
             self._live[start_idx + i] = 1
+            if widen:
+                self._zone_widen(row)
         self._mm[base_offset : base_offset + len(buf)] = buf
         self._count += len(rows)
         return start_idx
@@ -363,6 +385,8 @@ class Slab:
             raise KeyError(f"Row {idx} not found")
         raw = self.schema.encode_row(row)
         start = self._row_offset(idx)
+        if self._zone_built and self.schema._zone_columns:
+            self._zone_widen(row)
         if self._crypt is not None:
             raw = self._crypt(raw, start)
         mv = memoryview(self._mm)[start : start + len(raw)]
@@ -373,17 +397,32 @@ class Slab:
             self._live[idx] = 0
 
     def iter_rows(self) -> Iterator[Tuple[int, Dict[str, Any]]]:
-        # Inline the hot read path to avoid redundant bounds/liveness checks.
+        count = self._count
+        if count == 0:
+            return
         row_width = self.schema.row_width
+        live = self._live
+        if self._crypt is None:
+            # Whole-slab batch decode: one contiguous byte-copy + one
+            # struct.iter_unpack pass over all `count` rows (live and dead),
+            # instead of a Python-level struct.unpack call per live row. Dead
+            # rows still get unpacked but that's a cheap C-level no-op compared
+            # to the interpreter overhead this replaces.
+            buf = bytes(memoryview(self._mm)[self._offset:self._offset + count * row_width])
+            for i, row in enumerate(self.schema.iter_unpack_rows(buf)):
+                if live[i]:
+                    yield i, row
+            return
+        # Encrypted slab: nonce is derived per absolute offset, so rows must
+        # be decrypted individually before they can be unpacked.
         offset = self._offset
         mm = self._mm
         crypt = self._crypt
-        for i in range(self._count):
-            if self._live[i]:
+        for i in range(count):
+            if live[i]:
                 start = offset + i * row_width
                 raw: bytes = bytes(memoryview(mm)[start:start + row_width])
-                if crypt is not None:
-                    raw = crypt(raw, start)
+                raw = crypt(raw, start)
                 yield i, self.schema.decode_row(raw)
 
     def iter_raw(self) -> Iterator[Tuple[int, memoryview]]:
@@ -430,6 +469,22 @@ class CDCLog:
                 for line in f:
                     events.append(json.loads(line))
         return events
+
+
+# ── Metric timing helpers ──────────────────────────────────────────────────────
+
+_NULL_CTX = nullcontext()
+
+
+@contextmanager
+def _metric_timer(db: "SnapDB", name: str):
+    start = time.time()
+    try:
+        yield
+    finally:
+        elapsed = time.time() - start
+        db._m_inc(f"db_{name}_total")
+        db._m_lat(f"db_{name}_latency", elapsed)
 
 
 # ── SnapDB Engine ──────────────────────────────────────────────────────────────
@@ -493,8 +548,6 @@ class SnapDB:
             self._table = ColumnarTable(
                 "columnar_store", schema.to_columnar_schema(),
                 dict_columns=dict_columns, delta_columns=delta_columns)
-            if self.path.exists() and self.path.stat().st_size > 0:
-                self._load_columnar()
             self._indexes = None
             self._wal = None
             self._slabs = None
@@ -503,7 +556,15 @@ class SnapDB:
             self._total_rows = 0
             self._in_tx = False
             self._tx_state: List[Tuple[str, int, Optional[Dict]]] = []
-            self._rebuild_unique_constraints()
+            try:
+                if self.path.exists() and self.path.stat().st_size > 0:
+                    self._load_columnar()
+                self._rebuild_unique_constraints()
+            except Exception:
+                # A failed open (corrupt/encrypted file) must not leak the
+                # process-wide lock, or the path could never be reopened.
+                self._release_file_lock()
+                raise
             return
 
         # Row-oriented storage
@@ -521,8 +582,15 @@ class SnapDB:
         if MultiIndex is not None:
             self._indexes = MultiIndex()
         if WAL is not None:
-            wal_path = str(self.path).replace(".snap", ".wal")
-            self._wal = WAL(wal_path, encryption_key=encryption_key)
+            # Suffix-based sidecar derivation (like the .lock file above). The
+            # old str.replace(".snap", ".wal") aliased the WAL onto the database
+            # file itself for paths without ".snap" (WAL appends/clears would
+            # then corrupt or delete the database).
+            if self.path.suffix == ".snap":
+                wal_path = self.path.with_suffix(".wal")
+            else:
+                wal_path = self.path.with_suffix(self.path.suffix + ".wal")
+            self._wal = WAL(str(wal_path), encryption_key=encryption_key)
 
         if page_size > 65535:
             self._release_file_lock()
@@ -531,14 +599,22 @@ class SnapDB:
             self._release_file_lock()
             raise ValueError(f"Row size ({schema.row_width}) exceeds page size ({page_size})")
 
-        if self.path.exists() and self.path.stat().st_size >= _HEADER_SIZE:
-            self._load()
-        else:
-            self._create()
-        self._recover_wal()
-        self._unique_columns = [c.name for c in self.schema.columns if c.unique or c.primary_key]
-        self._unique_values = {c: {} for c in self._unique_columns}
-        self._rebuild_unique_constraints()
+        try:
+            if self.path.exists() and self.path.stat().st_size >= _HEADER_SIZE:
+                self._load()
+            else:
+                self._create()
+            self._recover_wal()
+            self._unique_columns = [c.name for c in self.schema.columns if c.unique or c.primary_key]
+            self._unique_values = {c: {} for c in self._unique_columns}
+            self._rebuild_unique_constraints()
+        except Exception:
+            # A failed open (bad magic, corrupt schema, WAL/constraint errors)
+            # must not leak the process-wide lock, or the path could never be
+            # reopened in this process.
+            self._close_mapping_only()
+            self._release_file_lock()
+            raise
 
     def _acquire_file_lock(self) -> None:
         """Prevent two writable SnapDB instances from opening one file.
@@ -657,6 +733,10 @@ class SnapDB:
 
     def _rebuild_unique_constraints(self) -> None:
         self._unique_values = {c: {} for c in self._unique_columns}
+        if not self._unique_columns:
+            # No unique/primary-key columns — skip the full-table scan that
+            # would otherwise run on every open/fsck/compact.
+            return
         for idx, row in self:
             self._validate_unique(row, existing_idx=idx)
             self._unique_insert(idx, row)
@@ -719,7 +799,14 @@ class SnapDB:
                 slab._count = self._rows_per_slab
             else:
                 slab._count = min(flags, self._rows_per_slab)
-            self._total_rows += sum(1 for b in slab._live if b)
+            # This slab's rows came straight from disk, not through
+            # insert()/batch_insert(), so its zone map (built lazily on first
+            # range query — see Slab.ensure_zone_map) knows nothing yet.
+            slab._zone_built = False
+            # bytearray.count(1) is a single C-level call — the previous
+            # Python for-loop popcount was the dominant cost of opening a
+            # large file (O(total capacity) interpreter iterations).
+            self._total_rows += slab._live.count(1)
             self._slabs.append(slab)
 
     def _recover_wal(self) -> None:
@@ -741,6 +828,18 @@ class SnapDB:
                 pending.append(record)
         if not committed:
             return
+        # Net out per-index operations first: an insert/update superseded by a
+        # later delete of the same idx must not be replayed at all — replaying
+        # the insert would append at the high-water mark and resurrect the
+        # deleted row at a new index (get(idx) can't tell "never applied" from
+        # "applied then deleted").
+        netted: List[Dict[str, Any]] = []
+        for record in committed:
+            if record.get("op") == "delete":
+                idx = record.get("idx")
+                netted = [r for r in netted if r.get("idx") != idx]
+            netted.append(record)
+        committed = netted
         self._recovering = True
         try:
             for record in committed:
@@ -837,19 +936,10 @@ class SnapDB:
             self._metrics.add_latency(metric, seconds)
 
     def _m_time(self, metric_name: str):
-        """Context manager for timing operations."""
-        class _Timer:
-            def __init__(self, outer, name):
-                self._outer = outer
-                self._name = name
-                self._start = 0.0
-            def __enter__(self):
-                self._start = time.time()
-            def __exit__(self, *args):
-                elapsed = time.time() - self._start
-                self._outer._m_inc(f"db_{self._name}_total")
-                self._outer._m_lat(f"db_{self._name}_latency", elapsed)
-        return _Timer(self, metric_name)
+        """Context manager for timing operations (no-op without metrics)."""
+        if self._metrics is None:
+            return _NULL_CTX
+        return _metric_timer(self, metric_name)
 
     # ── CDC helper ───────────────────────────────────────────────────────────
 
@@ -874,22 +964,13 @@ class SnapDB:
                 self._index_insert(idx, row)
                 self._unique_insert(idx, row)
                 return idx
-            for slab_idx, slab in enumerate(self._slabs):
-                if not slab.is_full:
-                    local_idx = slab.insert(row)
-                    global_idx = slab_idx * self._rows_per_slab + local_idx
-                    self._total_rows += 1
-                    self._cdc_log("insert", global_idx, row)
-                    self._index_insert(global_idx, row)
-                    self._unique_insert(global_idx, row)
-                    if self._in_tx:
-                        self._tx_state.append(("insert", global_idx, dict(row)))
-                        if self._wal is not None and not self._recovering:
-                            self._wal.append("insert", idx=global_idx, row=dict(row))
-                    return global_idx
-            self._expand()
-            idx = self._slabs[-1].insert(row)
-            global_idx = (len(self._slabs) - 1) * self._rows_per_slab + idx
+            # Slabs fill strictly in order and deleted slots are never reused
+            # (Slab._count is a high-water mark), so only the LAST slab can
+            # have space — no need to scan from slab 0 on every insert.
+            if not self._slabs or self._slabs[-1].is_full:
+                self._expand()
+            local_idx = self._slabs[-1].insert(row)
+            global_idx = (len(self._slabs) - 1) * self._rows_per_slab + local_idx
             self._total_rows += 1
             self._cdc_log("insert", global_idx, row)
             self._index_insert(global_idx, row)
@@ -901,7 +982,10 @@ class SnapDB:
             return global_idx
 
     def batch_insert(self, rows: List[Dict[str, Any]]) -> int:
-        """Insert multiple rows at once — much faster than individual inserts."""
+        """Insert multiple rows at once — much faster than individual inserts.
+
+        Returns the number of rows inserted (same for row and columnar storage).
+        """
         with self._lock:
             return self._batch_insert_locked(rows)
 
@@ -923,7 +1007,10 @@ class SnapDB:
                     self._index_insert(start_idx + offset, row)
             for offset, row in enumerate(rows):
                 self._unique_insert(start_idx + offset, row)
-            return start_idx
+            if self._cdc is not None:
+                for offset, row in enumerate(rows):
+                    self._cdc_log("insert", start_idx + offset, row)
+            return len(rows)
         n = len(rows)
         if n == 0:
             return 0
@@ -934,6 +1021,7 @@ class SnapDB:
             or has_range_indexes
             or bool(self._unique_columns)
             or self._in_tx
+            or self._cdc is not None
         )
 
         # Pre-grow the file ONCE for the whole batch (was one truncate/remap per
@@ -946,12 +1034,14 @@ class SnapDB:
             self._grow_to((needed + self._rows_per_slab - 1) // self._rows_per_slab)
 
         total_inserted = 0
-        remaining = rows
-        # Advance through slabs from the first non-full one (no rescans).
+        # Advance through slabs from the first non-full one (no rescans). A
+        # cursor into `rows` avoids re-slicing the remaining tail once per slab
+        # (which was O(n^2) list copying for large batches).
+        pos = 0
         slab_idx = 0
         while slab_idx < len(self._slabs) and self._slabs[slab_idx].is_full:
             slab_idx += 1
-        while remaining:
+        while pos < n:
             if slab_idx >= len(self._slabs):
                 self._grow_to(1)  # safety net; pre-grow should make this unreachable
             slab = self._slabs[slab_idx]
@@ -959,12 +1049,13 @@ class SnapDB:
             if space <= 0:
                 slab_idx += 1
                 continue
-            chunk = remaining[:space]
+            chunk = rows[pos:pos + space]
             local_start = slab.batch_insert(chunk)
             if maintain_per_row:
                 base = slab_idx * self._rows_per_slab + local_start
                 for offset, row in enumerate(chunk):
                     gidx = base + offset
+                    self._cdc_log("insert", gidx, row)
                     if has_hash_indexes or has_range_indexes:
                         self._index_insert(gidx, row)
                     if self._unique_columns:
@@ -977,7 +1068,7 @@ class SnapDB:
                             self._wal.append("insert", idx=gidx, row=dict(row))
             self._total_rows += len(chunk)
             total_inserted += len(chunk)
-            remaining = remaining[space:]
+            pos += len(chunk)
             slab_idx += 1
         return total_inserted
 
@@ -985,6 +1076,10 @@ class SnapDB:
         with self._m_time("get"):
             if self.is_columnar():
                 return self._table.get(idx)
+            if idx < 0:
+                # Floor division would give slab_idx=-1, which Python indexing
+                # silently resolves to the LAST slab — an unrelated row.
+                return None
             slab_idx = idx // self._rows_per_slab
             local_idx = idx % self._rows_per_slab
             if slab_idx >= len(self._slabs):
@@ -994,6 +1089,8 @@ class SnapDB:
     def get_raw(self, idx: int) -> Optional[memoryview]:
         with self._m_time("get_raw"):
             if self.is_columnar():
+                return None
+            if idx < 0:
                 return None
             slab_idx = idx // self._rows_per_slab
             local_idx = idx % self._rows_per_slab
@@ -1135,6 +1232,8 @@ class SnapDB:
                 self._cdc_log("update", idx, merged, old)
                 self._index_update(idx, old, merged)
                 return
+            if idx < 0:
+                raise KeyError(f"Row {idx} not found")
             slab_idx = idx // self._rows_per_slab
             local_idx = idx % self._rows_per_slab
             if slab_idx >= len(self._slabs):
@@ -1166,6 +1265,8 @@ class SnapDB:
                 self._index_delete(idx, old)
                 self._unique_delete(idx, old)
                 return
+            if idx < 0:
+                raise KeyError(f"Row {idx} not found")
             slab_idx = idx // self._rows_per_slab
             local_idx = idx % self._rows_per_slab
             if slab_idx >= len(self._slabs):
@@ -1318,6 +1419,100 @@ class SnapDB:
             shutil.copy2(self.path, dest)
         return dest
 
+    # ── Named snapshots ────────────────────────────────────────────────────
+    #
+    # A pragmatic v1: each snapshot is a full materialized copy (built on the
+    # same flush()+copy machinery as backup()), tracked by name in a small
+    # JSON manifest next to the live file. This is NOT copy-on-write / MVCC —
+    # there's no continuous history and no O(1) snapshot — it's a named,
+    # restorable point-in-time backup you can open and query independently.
+    # True copy-on-write time travel (redirect writes to new slabs, version
+    # the liveness bitmaps) is real future work; this ships the useful part
+    # (restorable named history) now without committing to that on-disk
+    # format decision.
+
+    def _snapshot_dir(self) -> Path:
+        return self.path.parent / f"{self.path.stem}.snapshots"
+
+    @staticmethod
+    def _read_snapshot_manifest(snap_dir: Path) -> Dict[str, Dict[str, Any]]:
+        mpath = snap_dir / "manifest.json"
+        if mpath.exists():
+            return json.loads(mpath.read_text(encoding="utf-8"))
+        return {}
+
+    @staticmethod
+    def _write_snapshot_manifest(snap_dir: Path, manifest: Dict[str, Dict[str, Any]]) -> None:
+        # Atomic write: a crash mid-write must never leave a half-written
+        # (unparseable) manifest.json, which would make every existing
+        # snapshot unlistable. Write to a temp file, then os.replace().
+        mpath = snap_dir / "manifest.json"
+        tmp = snap_dir / "manifest.json.tmp"
+        tmp.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        os.replace(tmp, mpath)
+
+    def snapshot(self, name: Optional[str] = None) -> str:
+        """Save a named, point-in-time copy of the database. Returns the
+        snapshot name used (auto-generated as ``snap_<n>_<timestamp>`` if
+        omitted). Calling this again with the same name overwrites that slot.
+
+        Read it back with :meth:`open_snapshot`; list existing snapshots with
+        :meth:`list_snapshots`.
+        """
+        with self._lock:
+            if name is None:
+                self._snapshot_seq = getattr(self, "_snapshot_seq", 0) + 1
+                name = f"snap_{self._snapshot_seq}_{int(time.time())}"
+            snap_dir = self._snapshot_dir()
+            dest = snap_dir / f"{name}.snap"
+            self.backup(dest)  # flush()/persist + copy — same durability as backup()
+            manifest = self._read_snapshot_manifest(snap_dir)
+            manifest[name] = {
+                "file": dest.name,
+                "created_at": time.time(),
+                "rows": len(self),
+                "storage_type": self._storage_type,
+            }
+            self._write_snapshot_manifest(snap_dir, manifest)
+        return name
+
+    def list_snapshots(self) -> List[Dict[str, Any]]:
+        """Return metadata for every snapshot taken from this database,
+        newest first: ``{"name", "file", "created_at", "rows", "storage_type"}``."""
+        manifest = self._read_snapshot_manifest(self._snapshot_dir())
+        out = [{"name": name, **meta} for name, meta in manifest.items()]
+        out.sort(key=lambda e: e["created_at"], reverse=True)
+        return out
+
+    def open_snapshot(self, name: str,
+                      encryption_key: Union[str, bytes, None] = None) -> "SnapDB":
+        """Open a previously taken snapshot as an independent SnapDB instance
+        — a separate materialized copy. Writes to it never affect the live
+        database or the manifest entry; the caller must close() it. Pass
+        ``encryption_key`` if the live database is encrypted (the key itself
+        is never persisted, so it can't be recovered automatically)."""
+        snap_dir = self._snapshot_dir()
+        manifest = self._read_snapshot_manifest(snap_dir)
+        if name not in manifest:
+            raise KeyError(f"No snapshot named {name!r}")
+        snap_path = snap_dir / manifest[name]["file"]
+        if not snap_path.exists():
+            raise FileNotFoundError(f"Snapshot file missing: {snap_path}")
+        return SnapDB(snap_path, self.schema, storage_type=manifest[name]["storage_type"],
+                      encryption_key=encryption_key)
+
+    def drop_snapshot(self, name: str) -> None:
+        """Delete a named snapshot (file + manifest entry)."""
+        snap_dir = self._snapshot_dir()
+        manifest = self._read_snapshot_manifest(snap_dir)
+        if name not in manifest:
+            raise KeyError(f"No snapshot named {name!r}")
+        snap_path = snap_dir / manifest[name]["file"]
+        if snap_path.exists():
+            snap_path.unlink()
+        del manifest[name]
+        self._write_snapshot_manifest(snap_dir, manifest)
+
     def fsck(self) -> Dict[str, Any]:
         """Run lightweight consistency checks and return a report."""
         issues: List[str] = []
@@ -1333,7 +1528,7 @@ class SnapDB:
         if not self.is_columnar():
             live_count = 0
             for slab in self._slabs:
-                live_count += sum(1 for b in slab._live[:slab._count] if b)
+                live_count += slab._live[:slab._count].count(1)
             if live_count != self._total_rows:
                 issues.append(f"metadata row count {self._total_rows} != live bitmap count {live_count}")
             if iter_count != self._total_rows:
@@ -1473,6 +1668,11 @@ class SnapDB:
                 self._file.close()
                 self._file = None
             if self._wal is not None:
+                # Everything was just persisted (bitmaps + mmap flush), so any
+                # remaining WAL records are stale; replaying them on the next
+                # open would re-apply committed ops (e.g. resurrect a row that
+                # was inserted and then deleted in a committed transaction).
+                self._wal.clear()
                 self._wal.close()
             if self._cdc is not None:
                 self._cdc.close()
@@ -1612,15 +1812,19 @@ class SnapDB:
                     if (row := self.get(row_idx)) is not None]
 
         out = []
-        for _, row in self:
-            value = row.get(column)
-            if value is None:
-                continue
-            if low is not None and (value < low if include_low else value <= low):
-                continue
-            if high is not None and (value > high if include_high else value >= high):
-                continue
-            out.append(row)
+        for slab in self._slabs:
+            slab.ensure_zone_map()
+            if not slab.zone_overlaps(column, low, high, include_low, include_high):
+                continue  # entire slab pruned — never decoded
+            for _, row in slab.iter_rows():
+                value = row.get(column)
+                if value is None:
+                    continue
+                if low is not None and (value < low if include_low else value <= low):
+                    continue
+                if high is not None and (value > high if include_high else value >= high):
+                    continue
+                out.append(row)
         return out
 
     def find(self, **kwargs) -> List[Dict[str, Any]]:

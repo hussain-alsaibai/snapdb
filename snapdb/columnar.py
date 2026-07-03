@@ -19,6 +19,8 @@ import importlib.util
 import operator
 from typing import Any, Dict, List, Tuple, Callable, Iterator, Optional
 
+from ._util import _TYPE_CODES, _type_size, _norm_value
+
 # NumPy is an OPTIONAL accelerator (issue #14). We only check availability at
 # import time (no actual import / no hard dependency); the array module path is
 # always the zero-dependency default.
@@ -32,20 +34,6 @@ _FILTER_OPS = {
     "gte": operator.ge, ">=": operator.ge,
     "lt": operator.lt, "<": operator.lt,
     "lte": operator.le, "<=": operator.le,
-}
-
-_TYPE_CODES = {
-    "i8": "b", "i16": "h", "i32": "i", "i64": "q",
-    "u8": "B", "u16": "H", "u32": "I", "u64": "Q",
-    "f32": "f", "f64": "d",
-    "bool": "?",
-}
-
-_TYPE_SIZES = {
-    "i8": 1, "i16": 2, "i32": 4, "i64": 8,
-    "u8": 1, "u16": 2, "u32": 4, "u64": 8,
-    "f32": 4, "f64": 8,
-    "bool": 1,
 }
 
 # Numeric types eligible for delta encoding
@@ -63,22 +51,14 @@ _NUMPY_DTYPE = {
 }
 
 
-def _type_size(dtype: str) -> int:
-    if dtype.startswith("bytes"):
-        return int(dtype.split(":")[1])
-    return _TYPE_SIZES[dtype]
+# array.array has no "?" typecode, so bool columns use "B" instead.
+_ARRAY_TYPECODES = {**_TYPE_CODES, "bool": "B"}
 
 
 def _array_typecode(dtype: str) -> str:
     if dtype.startswith("bytes"):
         return "list"
-    mapping = {
-        "i8": "b", "i16": "h", "i32": "i", "i64": "q",
-        "u8": "B", "u16": "H", "u32": "I", "u64": "Q",
-        "f32": "f", "f64": "d",
-        "bool": "B",
-    }
-    return mapping[dtype]
+    return _ARRAY_TYPECODES[dtype]
 
 
 def _smallest_delta_typecode(max_delta: int, signed: bool = False) -> str:
@@ -120,6 +100,7 @@ class Column:
         "_delta_base", "_delta_prev", "_deltas", "_delta_typecode", "_delta_cache",
         "_for_encode", "_for_threshold", "_for_mode", "_for_fallback",
         "_for_stats", "_for_min", "_for_bits", "_for_mask", "_for_packed", "_for_count",
+        "_for_cache",
         "_data", "_nullmask",
     )
 
@@ -162,15 +143,23 @@ class Column:
         self._for_mask: int = 0
         self._for_packed: int = 0
         self._for_count: int = 0
+        # Lazily-built full reconstruction of a FOR-packed column, mirroring
+        # _delta_cache — an aggregate over a bit-packed column previously
+        # decoded each value one shift-and-mask at a time through a Python
+        # generator (iter_valid); building the array once and reducing it
+        # with the C-level sum()/min()/max() is faster for repeated reads.
+        self._for_cache: Optional[array.array] = None
         self._data: Any = None
         self._nullmask: Optional[array.array] = None
         self._init_storage()
 
     def _init_storage(self) -> None:
         if self.dtype == "bool":
-            # Bit-packed boolean storage: Python int bitmask
-            # _data is an int where bit i = value of row i (1=True, 0=False)
-            self._data = 0
+            # Bit-packed boolean storage: mutable bytearray bitset where bit i
+            # = value of row i (1=True, 0=False). A bytearray sets bits in
+            # place — a Python int bitmask is immutable, so every append would
+            # copy the whole mask (O(n) per append, O(n^2) per column build).
+            self._data = bytearray()
             self._nullmask = array.array("b")
         elif self.dtype.startswith("bytes"):
             if self._dict_encode:
@@ -192,6 +181,23 @@ class Column:
             typecode = _array_typecode(self.dtype)
             self._data = array.array(typecode)
             self._nullmask = array.array("b")
+
+    def _bool_get(self, idx: int) -> bool:
+        """Read bit ``idx`` of the bool bitset (missing bytes read as False)."""
+        byte_idx = idx >> 3
+        if byte_idx >= len(self._data):
+            return False
+        return bool((self._data[byte_idx] >> (idx & 7)) & 1)
+
+    def _bool_set(self, idx: int, value: bool) -> None:
+        """Set/clear bit ``idx`` of the bool bitset in place (O(1))."""
+        byte_idx = idx >> 3
+        if value:
+            while len(self._data) <= byte_idx:
+                self._data.append(0)
+            self._data[byte_idx] |= 1 << (idx & 7)
+        elif byte_idx < len(self._data):
+            self._data[byte_idx] &= 0xFF ^ (1 << (idx & 7))
 
     def _convert_to_raw(self) -> None:
         """Convert from dict mode back to raw storage (dict overflow)."""
@@ -257,37 +263,26 @@ class Column:
         return code
 
     def _start_delta_mode(self, value: int) -> None:
-        """Switch to delta encoding mode."""
+        """Switch to delta encoding mode.
+
+        Deltas are differences, so storage is always SIGNED regardless of the
+        column dtype (a u64 column can still step downward between rows);
+        _append_delta widens the typecode on demand.
+        """
         self._delta_mode = True
         self._delta_base = value
         self._delta_prev = value
-        # Determine smallest typecode for sample deltas
-        old_data = list(self._data) if hasattr(self._data, '__iter__') else []
-        max_delta = 0
-        prev = value
-        for v in old_data[1:]:
-            delta = abs(v - prev)
-            if delta > max_delta:
-                max_delta = delta
-            prev = v
-        # Also consider future deltas - start with a safe default
-        # For i64 timestamps, use i32; for u32, use u32; etc.
-        if self.dtype in ("i64", "u64"):
-            self._deltas = array.array("i")  # i32 for timestamps
-            self._delta_typecode = "i"
-        elif self.dtype in ("i32", "u32"):
-            self._deltas = array.array("i")  # i32
-            self._delta_typecode = "i"
-        else:
-            self._deltas = array.array("h")  # i16
-            self._delta_typecode = "h"
+        self._deltas = array.array("i")
+        self._delta_typecode = "i"
         # Remove first value from raw data (it becomes base)
         self._data = array.array(_array_typecode(self.dtype))
 
     def _upgrade_delta_storage(self, needed_max: int) -> None:
-        """Upgrade delta array to larger typecode if needed."""
-        signed = self.dtype in ("i32", "i64")
-        new_tc = _smallest_delta_typecode(needed_max, signed=signed)
+        """Upgrade delta array to larger typecode if needed. Always signed:
+        deltas can be negative even for unsigned column dtypes, and an
+        unsigned target typecode would OverflowError copying existing
+        negative deltas."""
+        new_tc = _smallest_delta_typecode(needed_max, signed=True)
         if new_tc == self._delta_typecode:
             return
         # Convert existing deltas
@@ -343,12 +338,24 @@ class Column:
         bit_pos = self._for_count * self._for_bits
         self._for_packed |= (delta & self._for_mask) << bit_pos
         self._for_count += 1
+        self._for_cache = None  # invalidate reconstruction cache
 
     def _get_for_value(self, idx: int) -> int:
         """Reconstruct value from FOR encoding at index."""
         bit_pos = idx * self._for_bits
         delta = (self._for_packed >> bit_pos) & self._for_mask
         return self._for_min + delta
+
+    def _ensure_for_cache(self) -> array.array:
+        """Return a cached full reconstruction, building it once if needed
+        (mirrors _ensure_delta_cache)."""
+        cache = self._for_cache
+        if cache is None:
+            cache = array.array(_array_typecode(self.dtype))
+            for i in range(self._for_count):
+                cache.append(self._get_for_value(i))
+            self._for_cache = cache
+        return cache
 
     def _widen_for(self, needed_delta: int) -> bool:
         """Repack the FOR column with enough bits to hold ``needed_delta``.
@@ -382,6 +389,7 @@ class Column:
         self._for_mode = False
         self._for_packed = 0
         self._for_count = 0
+        self._for_cache = None
 
     def _append_delta(self, value: int) -> None:
         """Append value using delta encoding."""
@@ -390,16 +398,7 @@ class Column:
         self._delta_prev = value
 
         # Check if delta fits in current typecode
-        if self._delta_typecode == "B":
-            if not (0 <= delta <= 255):
-                self._upgrade_delta_storage(abs(delta))
-        elif self._delta_typecode == "H":
-            if not (0 <= delta <= 65535):
-                self._upgrade_delta_storage(abs(delta))
-        elif self._delta_typecode == "I":
-            if not (0 <= delta <= 4294967295):
-                self._upgrade_delta_storage(abs(delta))
-        elif self._delta_typecode == "b":
+        if self._delta_typecode == "b":
             if not (-128 <= delta <= 127):
                 self._upgrade_delta_storage(abs(delta))
         elif self._delta_typecode == "h":
@@ -409,7 +408,14 @@ class Column:
             if not (-2147483648 <= delta <= 2147483647):
                 self._upgrade_delta_storage(abs(delta))
 
-        self._deltas.append(delta)
+        try:
+            self._deltas.append(delta)
+        except OverflowError:
+            # Delta exceeds even i64 range (possible for u64 columns whose
+            # values span more than 2^63) — delta encoding can't represent it;
+            # fall back to raw storage for the whole column.
+            self._convert_delta_to_raw()
+            self._data.append(value)
 
     def append(self, value: Any) -> None:
         if value is None:
@@ -447,9 +453,8 @@ class Column:
                 else:
                     self._data.append(bval)
             elif self.dtype == "bool":
-                bit_pos = len(self._nullmask) - 1
                 if value:
-                    self._data |= (1 << bit_pos)
+                    self._bool_set(len(self._nullmask) - 1, True)
             elif self._delta_encode and not self._delta_fallback:
                 # Delta encoding path
                 if not self._delta_mode:
@@ -468,14 +473,15 @@ class Column:
                             base = self._data[0]
                             old_data = list(self._data)  # Save before reset
                             self._start_delta_mode(base)
-                            # Convert existing samples to deltas
-                            prev = base
-                            for i in range(1, len(old_data)):
-                                delta = old_data[i] - prev
-                                self._deltas.append(delta)
-                                prev = old_data[i]
-                            self._delta_prev = prev
-                            self._delta_cache = None  # invalidate reconstruction cache
+                            # Convert existing samples through _append_delta so
+                            # typecode upgrades / raw fallback apply to sample
+                            # deltas too (a bare append could OverflowError on
+                            # a large step between samples).
+                            for v in old_data[1:]:
+                                if self._delta_fallback:
+                                    self._data.append(v)
+                                else:
+                                    self._append_delta(v)
                         else:
                             self._delta_fallback = True
                 else:
@@ -488,14 +494,14 @@ class Column:
                     self._data.append(value)
                     # Track min/max during sampling
                     if self._for_stats is None:
-                        self._for_stats = {"min": value, "max": value, "samples": []}
-                    self._for_stats["samples"].append(value)
+                        self._for_stats = {"min": value, "max": value, "count": 0}
+                    self._for_stats["count"] += 1
                     if value < self._for_stats["min"]:
                         self._for_stats["min"] = value
                     if value > self._for_stats["max"]:
                         self._for_stats["max"] = value
                     # Check if we should enable FOR mode
-                    if len(self._for_stats["samples"]) >= self._for_threshold:
+                    if self._for_stats["count"] >= self._for_threshold:
                         range_val = self._for_stats["max"] - self._for_stats["min"]
                         # Only enable if we save at least 50% space
                         # i32 = 32 bits, so FOR must use <= 16 bits per value
@@ -541,7 +547,7 @@ class Column:
                 return self._dict_values[code].decode("utf-8", errors="replace")
             return self._data[idx].decode("utf-8", errors="replace")
         if self.dtype == "bool":
-            return bool((self._data >> idx) & 1)
+            return self._bool_get(idx)
         if self._delta_mode and not self._delta_fallback:
             return self._get_delta_value(idx)
         if self._for_mode and not self._for_fallback:
@@ -559,8 +565,7 @@ class Column:
                 else:
                     self._data[idx] = b""
             elif self.dtype == "bool":
-                # Clear the bit
-                self._data &= ~(1 << idx)
+                self._bool_set(idx, False)
             elif self._delta_mode and not self._delta_fallback:
                 # Delta values are cumulative — zeroing a delta would shift every
                 # later row. Leave the chain intact; the nullmask hides this row.
@@ -586,10 +591,7 @@ class Column:
                 else:
                     self._data[idx] = bval
             elif self.dtype == "bool":
-                if value:
-                    self._data |= (1 << idx)
-                else:
-                    self._data &= ~(1 << idx)
+                self._bool_set(idx, bool(value))
             elif self._delta_mode and not self._delta_fallback:
                 # Delta mode: update is expensive (must recalc from idx)
                 # For now, convert to raw on update
@@ -625,7 +627,7 @@ class Column:
                 elif is_bytes:
                     yield i, data[i].decode("utf-8", errors="replace")
                 elif is_bool:
-                    yield i, bool((data >> i) & 1)
+                    yield i, self._bool_get(i)
                 elif is_for:
                     yield i, self._get_for_value(i)
                 else:
@@ -641,7 +643,10 @@ class Column:
         n = len(nullmask)
         if self.dtype == "bool":
             data = self._data
-            return [None if nullmask[i] else bool((data >> i) & 1) for i in range(n)]
+            nd = len(data)
+            return [None if nullmask[i]
+                    else bool(((data[i >> 3] if (i >> 3) < nd else 0) >> (i & 7)) & 1)
+                    for i in range(n)]
         if self.dtype.startswith("bytes"):
             if self._dict_mode and not self._dict_fallback:
                 values, codes = self._dict_values, self._dict_codes
@@ -730,8 +735,8 @@ class Column:
                 total = sum(len(d) for d in self._data)
                 return total + len(self._nullmask) + len(self._data) * 8
         elif self.dtype == "bool":
-            # Python int bitmask: ~1 bit per value
-            return (self._data.bit_length() + 7) // 8 + len(self._nullmask)
+            # Bytearray bitset: ~1 bit per value
+            return len(self._data) + len(self._nullmask)
         elif self._delta_mode and not self._delta_fallback:
             # Delta mode: base + deltas array
             return 8 + len(self._deltas) * self._deltas.itemsize + len(self._nullmask)  # type: ignore
@@ -811,6 +816,45 @@ class ColumnarTable:
     def __len__(self) -> int:
         return self._row_count
 
+    def _live_mask(self) -> bytearray:
+        """Per-row liveness bitmap (1 = live). A row is deleted only when EVERY
+        column is null — that is how delete() marks rows — so a legitimately
+        null first column must not hide a live row from scans/aggregates (it
+        previously did: get() saw the row while select/count/group_by skipped
+        it). The first column short-circuits the common case."""
+        cols = self._col_list
+        first = cols[0]._nullmask
+        rest = cols[1:]
+        n = self._row_count
+        live = bytearray(n)
+        for i in range(n):
+            if not first[i]:
+                live[i] = 1
+            else:
+                for col in rest:
+                    if not col._nullmask[i]:
+                        live[i] = 1
+                        break
+        return live
+
+    def _live_mask_np(self, np):
+        """NumPy boolean liveness mask (True = live), for the vectorized
+        filter/count paths. Same semantics as :meth:`_live_mask` (a row is
+        dead only when EVERY column is null) but computed with C-level array
+        ops instead of a per-row Python loop — otherwise the correctness fix
+        would make liveness the slowest part of an otherwise-vectorized scan.
+
+        ``all_null`` is intersected column-by-column; the intersection only
+        shrinks, so once no row is still all-null we stop early (the common
+        no-deletes / NOT-NULL-first-column case exits after one column)."""
+        cols = self._col_list
+        all_null = np.frombuffer(cols[0]._nullmask, dtype=np.int8) != 0
+        for col in cols[1:]:
+            if not all_null.any():
+                break
+            all_null &= np.frombuffer(col._nullmask, dtype=np.int8) != 0
+        return ~all_null
+
     def get(self, idx: int) -> Optional[Dict[str, Any]]:
         if idx < 0 or idx >= self._row_count:
             return None
@@ -843,8 +887,7 @@ class ColumnarTable:
         for col in self._col_list:
             col._nullmask[idx] = 1
             if col.dtype == "bool":
-                # Clear the bit at idx in the bitmask
-                col._data &= ~(1 << idx)
+                col._bool_set(idx, False)
             elif col.dtype.startswith("bytes"):
                 if col._dict_mode and not col._dict_fallback:
                     col._dict_codes[idx] = 0  # null placeholder
@@ -864,15 +907,15 @@ class ColumnarTable:
                 col._data[idx] = 0
 
     def _matching_indices(self, predicate: Optional[Callable[[Dict[str, Any]], bool]]) -> List[int]:
-        first_nullmask = self._col_list[0]._nullmask
+        live = self._live_mask()
         if predicate is None:
-            return [i for i in range(self._row_count) if not first_nullmask[i]]
+            return [i for i in range(self._row_count) if live[i]]
 
         mat = {col.name: col.tolist() for col in self._col_list}
         names = self._col_names
         out = []
         for i in range(self._row_count):
-            if first_nullmask[i]:
+            if not live[i]:
                 continue
             row = {name: mat[name][i] for name in names}
             if predicate(row):
@@ -901,12 +944,12 @@ class ColumnarTable:
 
         keys = self.columns[key_column].tolist()
         vals = self.columns[value_column].tolist()
-        live = self._col_list[0]._nullmask
+        live = self._live_mask()
         groups: Dict[Any, Any] = {}
         counts: Dict[Any, int] = {}
 
         for i in range(self._row_count):
-            if live[i]:
+            if not live[i]:
                 continue
             key = keys[i]
             val = vals[i]
@@ -950,7 +993,7 @@ class ColumnarTable:
         matched = 0
 
         all_cols = self._col_list
-        first_nullmask = all_cols[0]._nullmask
+        live = self._live_mask()
 
         # Materialize the needed columns up front. This avoids per-cell
         # __getitem__ dispatch and, crucially, keeps delta columns O(n) instead
@@ -962,8 +1005,7 @@ class ColumnarTable:
             mat = {name: self.columns[name].tolist() for name in col_names}
 
         for idx in range(self._row_count):
-            # Quick null check: skip if first col is null (likely deleted)
-            if first_nullmask[idx]:
+            if not live[idx]:
                 continue
 
             if where is not None:
@@ -1037,8 +1079,7 @@ class ColumnarTable:
         # bytes columns materialize to decoded str — normalize comparison
         # values (given as bytes or str) the same way so they compare equal.
         if col.dtype.startswith("bytes"):
-            def _conv(x):
-                return x.decode("utf-8", errors="replace") if isinstance(x, bytes) else x
+            _conv = _norm_value
         else:
             def _conv(x):
                 return x
@@ -1078,7 +1119,7 @@ class ColumnarTable:
         materialized: Dict[str, List[Any]] = {}
         if _HAS_NUMPY and (use_numpy is None or use_numpy):
             import numpy as np
-            live = np.frombuffer(self._col_list[0]._nullmask, dtype=np.int8) == 0
+            live = self._live_mask_np(np)
             if not norm:
                 return int(live.sum())
             masks = [self._condition_mask_numpy(self.columns[c], op, v, materialized, np)
@@ -1092,12 +1133,7 @@ class ColumnarTable:
                     comb = comb & m
             return int((comb & live).sum())
         # Pure-Python: combine byte masks as a big integer and popcount.
-        live = bytearray(n)
-        first_nullmask = self._col_list[0]._nullmask
-        for i in range(n):
-            if not first_nullmask[i]:
-                live[i] = 1
-        live_int = int.from_bytes(live, "little")
+        live_int = int.from_bytes(self._live_mask(), "little")
         if not norm:
             return bin(live_int).count("1")
         masks = [int.from_bytes(self._condition_mask(c, op, v, materialized), "little")
@@ -1124,25 +1160,15 @@ class ColumnarTable:
             if col._data.typecode == "f":
                 arr = arr.astype(np.float64)
             valid = np.frombuffer(col._nullmask, dtype=np.int8) == 0
-            if op in ("eq", "=="):
-                m = arr == value
-            elif op in ("ne", "!="):
-                m = arr != value
-            elif op in ("gt", ">"):
-                m = arr > value
-            elif op in ("gte", ">="):
-                m = arr >= value
-            elif op in ("lt", "<"):
-                m = arr < value
-            elif op in ("lte", "<="):
-                m = arr <= value
-            elif op == "in":
+            if op == "in":
                 m = np.isin(arr, np.asarray(list(value)))
             elif op == "between":
                 lo, hi = value
                 m = (arr >= lo) & (arr <= hi)
-            else:  # pragma: no cover - ops are validated upstream
-                m = np.zeros(arr.shape[0], dtype=bool)
+            else:
+                # operator.eq/gt/... apply element-wise to NumPy arrays, so the
+                # shared table serves here too (ops are validated upstream).
+                m = _FILTER_OPS[op](arr, value)
             return m & valid  # nulls never match
 
         # Dict-encoded string column: equality/membership can compare the
@@ -1174,7 +1200,7 @@ class ColumnarTable:
 
     def _select_where_numpy(self, norm, col_names, n, limit, offset, combine, materialized):
         import numpy as np
-        live = np.frombuffer(self._col_list[0]._nullmask, dtype=np.int8) == 0
+        live = self._live_mask_np(np)
         if not norm:
             final = live
         else:
@@ -1237,14 +1263,8 @@ class ColumnarTable:
             return self._select_where_numpy(norm, col_names, n, limit, offset,
                                             combine, materialized)
 
-        # Live rows: exclude deleted rows via the first-column-null heuristic
-        # (matching select()).
-        first_nullmask = self._col_list[0]._nullmask
-        live = bytearray(n)
-        for i in range(n):
-            if not first_nullmask[i]:
-                live[i] = 1
-        live_int = int.from_bytes(live, "little")
+        # Live rows: exclude deleted rows (matching select()).
+        live_int = int.from_bytes(self._live_mask(), "little")
 
         if not norm:
             final_int = live_int
@@ -1333,7 +1353,7 @@ class ColumnarTable:
             raise ValueError(f"Unknown column: {column_name}")
         col = self.columns[column_name]
 
-        if agg == "count":
+        if agg == "count" and where is None:
             return col.count_valid()
 
         # NumPy-accelerated path (issue #14): plain numeric column, no WHERE.
@@ -1365,6 +1385,27 @@ class ColumnarTable:
                     return min(data)
                 if agg == "max":
                     return max(data)
+
+            # Cached-reconstruction path: delta/FOR-encoded numeric columns,
+            # no nulls. The full reconstruction is already cached (built once,
+            # amortized across repeated reads via _ensure_delta_cache /
+            # _ensure_for_cache) — reducing it with sum()/min()/max() in C
+            # beats draining it through the iter_valid() generator one
+            # Python-level yield at a time.
+            cache = None
+            if col._delta_mode and not col._delta_fallback:
+                cache = col._ensure_delta_cache()
+            elif col._for_mode and not col._for_fallback:
+                cache = col._ensure_for_cache()
+            if cache is not None and len(cache) > 0 and col._nullmask.count(1) == 0:
+                if agg == "sum":
+                    return sum(cache)
+                if agg == "avg":
+                    return sum(cache) / len(cache)
+                if agg == "min":
+                    return min(cache)
+                if agg == "max":
+                    return max(cache)
 
         # Fast path: no where clause — iterate column directly
         if where is None:
@@ -1401,17 +1442,21 @@ class ColumnarTable:
         col_names = self._col_names
         mat = {c.name: c.tolist() for c in all_cols}
         target = mat[column_name]
-        first_nullmask = all_cols[0]._nullmask
+        live = self._live_mask()
         col_nullmask = col._nullmask
 
         def _matching_values():
             for idx in range(self._row_count):
-                if first_nullmask[idx] or col_nullmask[idx]:
+                if not live[idx] or col_nullmask[idx]:
                     continue
                 row = {name: mat[name][idx] for name in col_names}
                 if where(row):
                     yield target[idx]
 
+        if agg == "count":
+            # Filtered count: previously the early return above ignored the
+            # WHERE predicate entirely while sum/avg/min/max honored it.
+            return sum(1 for _ in _matching_values())
         if agg == "sum":
             return sum(_matching_values())
         if agg == "avg":
