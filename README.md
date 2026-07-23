@@ -39,6 +39,7 @@ pip install pysnapdb
 - **Columnar engine** — column-oriented `array.array` storage; full-scan aggregation runs ~27× faster than SQLite at a fraction of the memory
 - **NumPy-accelerated aggregates** *(optional, v0.8.0)* — when NumPy is installed, `aggregate()` runs over the zero-copy column buffer (~530M rows/s, on par with pandas); pure-Python remains the zero-dependency default
 - **NumPy-accelerated filters** *(optional, v0.9.0)* — `select_where()` builds masks vectorially; `count_where()` (filtered count, no row materialization) reaches ~314M rows/s on numeric predicates (~166× the pure-Python path)
+- **Bitmask Queries** 🔥 *(v0.10.0)* — `select_bitmask()` evaluates `(value >> pos) & 1` predicates on integer columns with AND / OR / XOR combination semantics; routes around the comparison operators when the predicate is naturally bit-level (flags, parity, presence masks)
 - **Low memory footprint** — ~2.2 MB / 100K rows vs. 2.9 MB for SQLite, 11 MB for pandas, 22 MB for a plain `dict` ([benchmarks](#benchmarks))
 - **Vectorized multi-condition filters** *(v0.6.0)* — `select_where()` combines per-column bitmasks with big-integer `AND`/`OR` (~2× faster on selective `WHERE` clauses)
 - **O(1) delta-encoded reads** *(v0.6.0)* — a lazy reconstruction cache turns delta scans from O(n²) into O(n)
