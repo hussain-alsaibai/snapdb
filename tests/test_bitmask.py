@@ -18,7 +18,6 @@ import random
 import unittest
 
 from snapdb import ColumnarTable
-from snapdb.columnar import _HAS_NUMPY
 
 
 _PANDAS = importlib.util.find_spec("pandas") is not None
