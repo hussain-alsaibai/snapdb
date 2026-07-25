@@ -15,7 +15,7 @@ from snapdb import SnapDB, Schema, ColumnDef, Metrics
 PASS = 0
 FAIL = 0
 
-def test(name, ok, detail=""):
+def _check( ok, detail=""):
     global PASS, FAIL
     if ok:
         PASS += 1
