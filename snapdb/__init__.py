@@ -22,6 +22,7 @@ __license__ = "MIT"
 from .core import SnapDB, Schema, ColumnDef, CDCLog
 from .columnar import ColumnarTable, Column
 from .metrics import Metrics
+from .profiler import QueryProfiler
 
 __all__ = [
     "SnapDB",
@@ -31,5 +32,6 @@ __all__ = [
     "Column",
     "Metrics",
     "CDCLog",
+    "QueryProfiler",
     "__version__",
 ]
