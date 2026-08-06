@@ -1,0 +1,22 @@
+{
+  "name": "pysnapdb",
+  "version": "0.11.0",
+  "description": "Lightweight pure-Python embedded database with row store and columnar analytics engine. Memory-mapped, zero-copy NumPy export, optional vectorized ops.",
+  "readme": "README.md",
+  "license": "MIT",
+  "keywords": ["database", "embedded", "columnar", "analytics", "mmap", "numpy"],
+  "authors": [{"name": "Hussain Alsaibai", "email": "hussain.alsaibai@gmail.com"}],
+  "repository": {"type": "git", "url": "https://github.com/hussain-alsaibai/snapdb"},
+  "classifiers": [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database"
+  ],
+  "requiresPython": ">=3.9"
+}
