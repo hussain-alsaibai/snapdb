@@ -10,6 +10,8 @@ v0.6.0: Vectorized filtering, auto-indexing, NumPy export.
 v0.7.0: Frame-of-Reference + bit packing for bounded numeric ranges.
 v0.8.0: Optional NumPy-accelerated aggregates over the zero-copy column buffer.
 v0.9.0: NumPy-accelerated select_where masks + count_where.
+v0.10.0: Bitmask query engine, PEP 688 __buffer__ on tables, to_dataframe,
+         compact() optimization.
 """
 
 from __future__ import annotations
@@ -81,6 +83,98 @@ def _smallest_delta_typecode(max_delta: int, signed: bool = False) -> str:
             return "I"   # u32
         else:
             return "Q"   # u64
+
+
+def _rebuild_column_alive(col: "Column", live: bytearray) -> int:
+    """Rebuild a column's value/null-mask arrays with dead rows dropped.
+
+    Returns the estimated bytes freed (col's old memory footprint minus the
+    rebuilt one), or ``0`` if the column is non-rebuildable for the current
+    encoding (e.g. dict overflow), in which case the column is left intact.
+    """
+    before = col.memory_usage()
+    alive_n = sum(1 for b in live if b)
+    if col.dtype == "bool":
+        # Bit-packed: rebuild the bytearray from the live bits.
+        old = col._data
+        new = bytearray((alive_n + 7) // 8)
+        out_idx = 0
+        for i, b in enumerate(live):
+            if b:
+                if (i >> 3) < len(old) and (old[i >> 3] >> (i & 7)) & 1:
+                    new[out_idx >> 3] |= 1 << (out_idx & 7)
+                out_idx += 1
+        col._data = new
+        col._nullmask = array.array("b", [0] * alive_n)
+        return max(0, before - col.memory_usage())
+    if col.dtype.startswith("bytes"):
+        if col._dict_mode and not col._dict_fallback:
+            # Drop dead rows from the dict-coded column; rebuild the dictionary
+            # so the codes stay dense.
+            new_values: List[bytes] = []
+            new_codes = array.array(col._dict_codes.typecode)
+            old_codes = col._dict_codes
+            mapping: Dict[int, int] = {}
+            for i, b in enumerate(live):
+                if not b:
+                    continue
+                old_code = old_codes[i]
+                if old_code not in mapping:
+                    mapping[old_code] = len(new_values)
+                    new_values.append(col._dict_values[old_code])
+                new_codes.append(mapping[old_code])
+            col._dict_values = new_values
+            col._dict = {v: i for i, v in enumerate(new_values)}
+            col._dict_codes = new_codes
+            col._nullmask = array.array("b", [0] * alive_n)
+            return max(0, before - col.memory_usage())
+        # Plain list-of-bytes fallback.
+        new_list = [col._data[i] for i, b in enumerate(live) if b]
+        col._data = new_list
+        col._nullmask = array.array("b", [0] * alive_n)
+        return max(0, before - col.memory_usage())
+    if col._delta_mode and not col._delta_fallback:
+        cache = col._ensure_delta_cache()
+        new_deltas = array.array(col._delta_typecode or "q")
+        prev = col._delta_base
+        for i, b in enumerate(live):
+            if not b:
+                continue
+            new_deltas.append(int(cache[i]) - prev)
+            prev = int(cache[i])
+        col._deltas = new_deltas
+        col._delta_cache = None
+        col._nullmask = array.array("b", [0] * alive_n)
+        return max(0, before - col.memory_usage())
+    if col._for_mode and not col._for_fallback:
+        # Rebuild the bit-packed FOR storage. Decode the live values, then
+        # re-pack against the new min/max so the encoding stays tight.
+        values = [col._get_for_value(i) for i in range(len(col._nullmask))
+                  if live[i]]
+        if not values:
+            col._nullmask = array.array("b", [])
+            return max(0, before - col.memory_usage())
+        new_min = min(values)
+        new_max = max(values)
+        new_range = new_max - new_min
+        new_bits = max(1, new_range.bit_length())
+        new_mask = (1 << new_bits) - 1
+        # Drop the legacy _for_packed integer (which is a 64-bit OR of the
+        # bit-windows) and let the column re-pack lazily on the next write.
+        col._for_min = new_min
+        col._for_bits = new_bits
+        col._for_mask = new_mask
+        col._for_packed = 0
+        col._for_count = len(values)
+        col._for_cache = None
+        col._nullmask = array.array("b", [0] * alive_n)
+        return max(0, before - col.memory_usage())
+    # Plain numeric column.
+    new_arr = array.array(col._data.typecode)
+    new_arr.extend(int(col._data[i]) for i, b in enumerate(live) if b)
+    col._data = new_arr
+    col._nullmask = array.array("b", [0] * alive_n)
+    return max(0, before - col.memory_usage())
 
 
 class Column:
@@ -1042,6 +1136,21 @@ class ColumnarTable:
             raise ValueError(f"Unknown column: {column_name}")
         return self.columns[column_name].buffer()
 
+    def __buffer__(self, flags: int) -> memoryview:
+        """PEP 688: expose a column buffer for zero-copy NumPy access.
+
+        Returns the buffer of the first column. Useful for the common case
+        where a :class:`ColumnarTable` holds a single primary-key-style column
+        and the caller wants to hand it straight to NumPy without copying.
+        For multi-column tables, prefer :meth:`column_buffer` to pick the
+        column explicitly. An empty table returns a 0-byte memoryview, which
+        matches :meth:`Column.buffer` semantics.
+        """
+        if not self._col_list:
+            # No schema columns at all — fall through to a 0-byte view.
+            return memoryview(b"")
+        return self._col_list[0].buffer()
+
     # ── Vectorized multi-condition filter (issue #4) ─────────────────────────
 
     def _normalize_conditions(self, conditions) -> List[Tuple[str, str, Any]]:
@@ -1303,6 +1412,149 @@ class ColumnarTable:
                     break
         return out
 
+    # ── Bitmask query engine (v0.10.0) ───────────────────────────────────────
+    #
+    # Bit-level predicates on integer columns: ``(column_value >> position) & 1``
+    # is compared against an expected bit value. Rows are emitted when the
+    # combination semantics (AND / OR / XOR across the supplied bits) match.
+    # Skips null rows (the encoded value is ``None`` / not addressable).
+
+    def select_bitmask(
+        self,
+        bitmask: Dict[str, Any],
+        match_all: bool = True,
+        operator: Optional[str] = None,
+        columns: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Query rows using bitmask operations on integer columns.
+
+        Args:
+            bitmask: ``{column: predicate}`` where ``predicate`` is one of:
+
+                - ``(bit_position, expected_value)`` — single bit, expected
+                  value 0 or 1.
+                - ``[(pos_0, val_0), (pos_1, val_1), ...]`` — multiple bits
+                  on the same column, combined internally with AND (every
+                  listed bit must match for that column to contribute).
+
+                For each row, the bit at ``bit_position`` (0-indexed from LSB)
+                of the column's integer value is compared against
+                ``expected_value`` (0 or 1). The engine supports three
+                combination semantics across the supplied columns
+                (``operator``), exposed as the standard bitwise ops:
+
+                - ``"AND"`` (default when ``match_all=True``): every column's
+                  bit predicate must match.
+                - ``"OR"`` (default when ``match_all=False``): any column's
+                  bit predicate matches.
+                - ``"XOR"``: an odd number of columns' bit predicates must
+                  match — useful for parity-style predicates.
+
+            columns: optional projected column list (defaults to all columns).
+            limit: cap on returned rows.
+            offset: skip this many matching rows before emitting.
+
+        Example:
+            db.select_bitmask({'status': (0, 1), 'type': (5, 1)})
+            # returns rows where bit 0 of 'status' == 1 AND bit 5 of 'type' == 1
+
+            db.select_bitmask({'flags': [(0, 1), (3, 1)]}, operator='XOR')
+            # returns rows where exactly one of bits 0/3 of 'flags' is set
+        """
+        if not bitmask:
+            return []
+        if operator is None:
+            operator = "AND" if match_all else "OR"
+        operator = operator.upper()
+        if operator not in ("AND", "OR", "XOR"):
+            raise ValueError(
+                f"operator must be 'AND', 'OR', or 'XOR', got {operator!r}"
+            )
+
+        # Normalise the bitmask spec: each value becomes a list[(pos, val)].
+        norm: Dict[str, List[Tuple[int, int]]] = {}
+        for col, spec in bitmask.items():
+            if col not in self.columns:
+                raise ValueError(f"Unknown column: {col!r}")
+            if isinstance(spec, tuple):
+                norm[col] = [spec]
+            elif isinstance(spec, list):
+                norm[col] = list(spec)
+            else:
+                raise TypeError(
+                    f"bitmask values for {col!r} must be (pos, val) or a list "
+                    f"of (pos, val) tuples, got {type(spec).__name__}"
+                )
+
+        # Validate columns and materialise the integer values column-at-a-time.
+        # tolist() handles delta / FOR / dict-encoded columns in a single O(n)
+        # pass each, so the overall scan is O(n * k) for k bitmask columns.
+        col_values: Dict[str, List[Any]] = {}
+        for col in norm:
+            if self.columns[col].dtype.startswith("bytes"):
+                raise TypeError(
+                    f"bitmask queries need an integer column, got {col!r} "
+                    f"with dtype={self.columns[col].dtype!r}"
+                )
+            col_values[col] = self.columns[col].tolist()
+
+        if columns is None:
+            col_names = self._col_names
+        else:
+            for c in columns:
+                if c not in self.columns:
+                    raise ValueError(f"Unknown column: {c!r}")
+            col_names = columns
+
+        # Project the requested columns once. Avoids per-row dict construction
+        # with the bits (the bitmask lookups live in col_values).
+        mat = {name: self.columns[name].tolist() for name in col_names}
+        live = self._live_mask()
+        n = self._row_count
+
+        def _column_iv_match(iv: int, bits: List[Tuple[int, int]]) -> bool:
+            """AND-combine the bits within a single column."""
+            for pos, val in bits:
+                if (iv >> pos) & 1 != (1 if val else 0):
+                    return False
+            return True
+
+        out: List[Dict[str, Any]] = []
+        matched = 0
+        for i in range(n):
+            if not live[i]:
+                continue
+            col_matches: Dict[str, bool] = {}
+            saw_value = False
+            for col, bits in norm.items():
+                v = col_values[col][i]
+                if v is None:
+                    col_matches[col] = False
+                    continue
+                saw_value = True
+                col_matches[col] = _column_iv_match(int(v), bits)
+
+            if operator == "AND":
+                # Every column (that has a value) must match.
+                ok = saw_value and all(col_matches.values())
+            elif operator == "OR":
+                ok = any(col_matches.values())
+            else:  # XOR — odd number of columns must match
+                ok = sum(1 for v in col_matches.values() if v) % 2 == 1
+
+            if not ok:
+                continue
+            if matched < offset:
+                matched += 1
+                continue
+            out.append({name: mat[name][i] for name in col_names})
+            matched += 1
+            if limit is not None and len(out) >= limit:
+                break
+        return out
+
     def _numpy_aggregate(self, col: "Column", agg: str):
         """NumPy-accelerated aggregate for a plain numeric column, no WHERE.
 
@@ -1483,6 +1735,60 @@ class ColumnarTable:
 
     def memory_usage(self) -> int:
         return sum(col.memory_usage() for col in self._col_list)
+
+    def to_dataframe(self):
+        """Export the table as a ``pandas.DataFrame`` (returns ``None`` if
+        pandas is not installed).
+
+        The optional pandas dependency is imported lazily so the zero-dep
+        default is unchanged. Nulls come back as ````NaN`` for numeric columns
+        and ````None`` otherwise — which is what pandas expects for object
+        columns. Encoded columns (delta / FOR / dict) are decoded on the way
+        out via :meth:`Column.tolist`.
+        """
+        try:
+            import pandas as pd  # type: ignore
+        except ImportError:
+            return None
+        data = {col: self.columns[col].tolist() for col in self._col_names}
+        return pd.DataFrame(data)
+
+    def compact(self) -> Dict[str, int]:
+        """Reclaim space after many deletes.
+
+        The columnar engine uses a per-row liveness bitmap rather than a
+        live-rows list, so compaction here is a count-and-report operation —
+        the underlying column arrays stay allocated (the live bits are what
+        filter them out). For callers that want a structurally-shrunk layout
+        we additionally rebuild the columns' value arrays with the dead rows
+        dropped, which visibly reduces :meth:`memory_usage` on tables where
+        many rows have been deleted. After rebuild, ``self._row_count`` is
+        lowered to the live row count so subsequent ``len()`` / scans work
+        on the shrunken dataset.
+
+        Returns a dict with ``rows_before``, ``rows_after``, ``rows_removed``,
+        and ``bytes_freed`` (estimate of bytes released by the column rebuild;
+        ``0`` if the engine skipped the rebuild because nothing was dead).
+        """
+        live = self._live_mask()
+        rows_before = self._row_count
+        rows_removed = sum(1 for b in live if not b)
+        rows_after = rows_before - rows_removed
+
+        bytes_freed = 0
+        if rows_removed > 0 and rows_after >= 0:
+            for col in self._col_list:
+                rebuilt = _rebuild_column_alive(col, live)
+                if rebuilt is not None:
+                    bytes_freed += rebuilt
+            self._row_count = rows_after
+
+        return {
+            "rows_before": rows_before,
+            "rows_after": rows_after,
+            "rows_removed": rows_removed,
+            "bytes_freed": bytes_freed,
+        }
 
     def __repr__(self) -> str:
         return f"ColumnarTable({self.name!r}, rows={self._row_count}, cols={self._col_names})"
