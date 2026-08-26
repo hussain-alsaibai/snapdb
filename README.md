@@ -157,6 +157,21 @@ repair_report = db.repair()
 
 See [Benchmarks](#benchmarks) for measured throughput and memory.
 
+## Agent Workflow Fit
+
+SnapDB is a good local data layer for autonomous developer workflows that need
+state stronger than a JSON file but lighter than Postgres:
+
+- **Run ledgers** — persist agent actions, costs, tool calls, outcomes, and retry history with indexed lookups.
+- **Bounty evidence stores** — keep reproducible findings, affected URLs, request metadata, and triage labels in a portable file.
+- **Webhook/event archives** — pair row storage, WAL, and CDC with `tiny-eventbus` to replay automation decisions.
+- **Fast local analytics** — use columnar mode for cron reports, benchmark summaries, and job-health scans.
+
+For OpenClaw-style agents, a practical stack is `tiny-router` for callbacks,
+`tiny-validator` for payload shape, `tiny-log` for structured output,
+`fast-cache` for short-lived memoization, and SnapDB for the durable local
+ledger.
+
 ## Dictionary Encoding (v0.4.0)
 
 For columns with few unique string values (status, category, type, country), dictionary encoding reduces memory by **3×**:
