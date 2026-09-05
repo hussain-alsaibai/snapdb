@@ -28,6 +28,15 @@ agents and developer tooling. SnapDB provides the durable local ledger layer.
 For ecosystem status, benchmarks, and cross-library reports, see the
 [dev-masterkit developer tool reports](https://github.com/hussain-alsaibai/dev-masterkit/tree/main/reports).
 
+### v0.3 Research: Columnar Analytics + Vector Search
+
+Research conducted Sept 5, 2026 explored adding vector search and columnar
+analytics to snapdb. Key findings:
+- **HNSW-IVF** for approximate nearest neighbor search in embedded DB
+- **String offset compression** for columnar storage (SOA layout)
+- **SIMD-accelerated** search possible with pure Python (numpy tricks)
+- See [research-snapdb-innovations.md](research-snapdb-innovations.md) for full findings
+
 ## Why SnapDB for AI Agents?
 
 In 2026, autonomous agents are the primary users of embedded databases. SnapDB is designed specifically for these use cases:
