@@ -270,6 +270,34 @@ class DocumentStore:
             json.dump(docs, f, indent=2, default=str)
         return len(docs)
 
+    def search(self, term: str, fields: Optional[List[str]] = None,
+               limit: int = 20) -> List[Dict[str, Any]]:
+        """Case-insensitive substring search across string fields.
+
+        Designed as a lightweight agent-memory / lexical retrieval primitive:
+        find the documents whose text fields contain ``term``, without needing
+        a full-text engine. Pass ``fields`` to restrict which columns are
+        searched (defaults to all string columns).
+        """
+        if self._db is None:
+            return []
+        term_l = term.lower()
+        candidates = fields if fields else list(self._field_types.keys())
+        results: List[Dict[str, Any]] = []
+        for _, row in self._db:
+            doc = self._decode(row)
+            for f in candidates:
+                val = doc.get(f)
+                if isinstance(val, str) and term_l in val.lower():
+                    results.append(doc)
+                    break
+                elif isinstance(val, (dict, list)) and term_l in str(val).lower():
+                    results.append(doc)
+                    break
+            if len(results) >= limit:
+                break
+        return results
+
     def import_json(self, path: str) -> int:
         """Import documents from JSON. Returns count."""
         with open(path, "r") as f:

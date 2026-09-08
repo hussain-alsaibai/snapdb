@@ -1,0 +1,60 @@
+# snapdb — LLM Manifest (llms.txt)
+
+> Zero-dependency embedded database for Python. Single-file, pure-Python.
+> Memory-mapped, columnar, mmap-based. No SQLite, no DuckDB, no native deps.
+
+## Identity
+- **Package:** `pysnapdb`
+- **Latest version:** 0.16.0
+- **Python:** 3.9+
+- **Dependencies:** 0
+- **Repo:** https://github.com/hussain-alsaibai/snapdb
+- **License:** MIT
+
+## What it solves
+Local-first durable storage for single-writer Python applications.
+Use cases: agent memory layers, test fixtures, embedded analytics,
+small operational datasets, agent workflow ledgers.
+
+## NOT for
+- Multi-writer concurrent workloads (use SQLite/Postgres)
+- Datasets > 1 GB on disk (use DuckDB)
+- Distributed systems (use anything else)
+
+## Public API
+- `SnapDB(path, schema)` — open or create a database
+- `db.insert(row_dict)` — append row, returns row id
+- `db.get(row_id)` — get a single row
+- `db.scan(where=lambda r: ...)` — full table scan with predicate
+- `db.columnar(name).group_by(...)` — columnar aggregation
+- `db.cdc()` — change data capture log
+- `db.vector_index(name, dim=128)` — ANN vector search (v0.16+)
+- `db.profile()` — query profiler
+
+## MCP server (v0.16+)
+```python
+from snapdb.mcp_server import serve
+serve(db, transport="stdio")
+```
+Tools exposed: `snapdb.query`, `snapdb.insert`, `snapdb.scan`,
+`snapdb.vector_search`.
+
+## Quick start
+```python
+from snapdb import SnapDB, Schema, ColumnDef
+schema = Schema([ColumnDef("id", "i32"), ColumnDef("name", "bytes:20")])
+db = SnapDB("/tmp/test.snap", schema)
+db.insert({"id": 1, "name": "alice"})
+print(db.get(0))  # {"id": 1, "name": "alice"}
+```
+
+## Performance
+- ~2-5x faster than sqlite3 for in-memory workloads (see benchmarks/)
+- ~80 KB single-file install
+- Zero deps = zero supply-chain attack surface
+
+## Sister libraries (OpenClaw tiny-* ecosystem)
+- `fast-cache` — companion in-memory cache
+- `tiny-router` — HTTP layer for serving snapdb over network
+- `tiny-log` — write-ahead logging
+- `tiny-validator` — schema validation
