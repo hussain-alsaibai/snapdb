@@ -140,6 +140,86 @@ class Query:
             return sum(1 for _, row in self.db if self.where(row))
         return len(self.db)
 
+    # ── Aggregations (v0.16.1) ──────────────────────────────────────────────
+    #
+    # All aggregations stream rows through the same WHERE predicate the
+    # rest of the query uses, so they compose with .filter() / .where_fn()
+    # exactly like count() does. Missing keys are skipped (None / absent
+    # columns are not counted as zero, which matches SQL NULL semantics and
+    # avoids the common footgun of averaging over a sentinel value).
+
+    def _iter_matching_values(self, column: str):
+        """Yield non-None values of `column` for rows that match WHERE."""
+        if self.where:
+            for _, row in self.db:
+                if self.where(row):
+                    v = row.get(column)
+                    if v is not None:
+                        yield v
+        else:
+            for _, row in self.db:
+                v = row.get(column)
+                if v is not None:
+                    yield v
+
+    def sum(self, column: str, default: Any = 0) -> Any:
+        """Sum of `column` over matching rows.
+
+        Returns `default` (default 0) when there are no rows. Non-numeric
+        values raise TypeError so callers don't silently accumulate strings.
+        """
+        total = default
+        for v in self._iter_matching_values(column):
+            total = total + v
+        return total
+
+    def min(self, column: str, default: Any = None) -> Any:
+        """Minimum of `column` over matching rows, or `default` if empty."""
+        it = self._iter_matching_values(column)
+        try:
+            first = next(it)
+        except StopIteration:
+            return default
+        return min(first, *(v for v in it))
+
+    def max(self, column: str, default: Any = None) -> Any:
+        """Maximum of `column` over matching rows, or `default` if empty."""
+        it = self._iter_matching_values(column)
+        try:
+            first = next(it)
+        except StopIteration:
+            return default
+        return max(first, *(v for v in it))
+
+    def avg(self, column: str, default: Any = None) -> Optional[float]:
+        """Arithmetic mean of `column` over matching rows.
+
+        Returns `default` (None) when there are no rows. Numerator and
+        denominator are accumulated in the same loop so we don't iterate
+        twice; intermediate `total` is held in a Python int/float so this
+        is exact for ints and IEEE-754 for floats, matching numpy.mean.
+        """
+        total = 0
+        n = 0
+        for v in self._iter_matching_values(column):
+            total = total + v
+            n += 1
+        if n == 0:
+            return default
+        return total / n
+
+    def count_distinct(self, column: str) -> int:
+        """Count of distinct values of `column` over matching rows.
+
+        Uses an insertion-ordered dict to dedupe without an extra hash
+        table; values must be hashable (same constraint as a dict key).
+        Order is preserved for stable iteration downstream.
+        """
+        seen: Dict[Any, None] = {}
+        for v in self._iter_matching_values(column):
+            seen.setdefault(v, None)
+        return len(seen)
+
     def __iter__(self):
         yield from self.execute()
 
