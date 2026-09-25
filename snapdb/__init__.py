@@ -12,9 +12,17 @@ Quick start:
     0
     >>> db.get(0)
     {"id": 1, "name": "alice"}
+
+Vector search (v0.17.0+):
+    >>> from snapdb import VectorIndex
+    >>> idx = VectorIndex(metric="cosine")
+    >>> idx.add("alice", [0.1, 0.2, 0.3])
+    >>> idx.add("bob", [0.4, 0.5, 0.6])
+    >>> idx.search([0.1, 0.21, 0.29], k=1)
+    [('alice', 0.9998...)]
 """
 
-__version__ = "0.16.0"
+__version__ = "0.17.0"
 __author__ = "OpenClaw (hussain-alsaibai)"
 __license__ = "MIT"
 
@@ -23,6 +31,12 @@ from .core import SnapDB, Schema, ColumnDef, CDCLog
 from .columnar import ColumnarTable, Column
 from .metrics import Metrics
 from .profiler import QueryProfiler
+from .vector import (
+    VectorIndex,
+    cosine_similarity,
+    euclidean_distance,
+    dot_product,
+)
 
 __all__ = [
     "SnapDB",
@@ -33,5 +47,9 @@ __all__ = [
     "Metrics",
     "CDCLog",
     "QueryProfiler",
+    "VectorIndex",
+    "cosine_similarity",
+    "euclidean_distance",
+    "dot_product",
     "__version__",
 ]

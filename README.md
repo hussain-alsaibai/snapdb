@@ -153,6 +153,7 @@ failures = store.select_where("outcome == 'error'").group_by("error_type")
 - [Storage Modes](#storage-modes)
 - [Dictionary Encoding](#dictionary-encoding-v040) · [Delta Encoding](#delta-encoding-v050)
 - [Vectorized Filtering](#vectorized-filtering-v060) · [Auto-Indexing](#auto-indexing-v060) · [NumPy / Zero-Copy Export](#numpy--zero-copy-export-v060)
+- [Vector Search](#vector-search-v0170)
 - [Benchmarks](#benchmarks)
 - [Architecture](#architecture) · [Supported Types](#supported-types)
 - [Development](#development)
@@ -163,6 +164,7 @@ failures = store.select_where("outcome == 'error'").group_by("error_type")
 
 - **Columnar engine** — column-oriented `array.array` storage; full-scan aggregation runs ~27× faster than SQLite at a fraction of the memory
 - **NumPy-accelerated aggregates** *(optional, v0.8.0)* — when NumPy is installed, `aggregate()` runs over the zero-copy column buffer (~530M rows/s, on par with pandas); pure-Python remains the zero-dependency default
+- **Vector similarity search** *(v0.17.0)* — `VectorIndex` with cosine / dot / Euclidean metrics, deterministic recall, JSON-safe serialization. Zero deps.
 - **NumPy-accelerated filters** *(optional, v0.9.0)* — `select_where()` builds masks vectorially; `count_where()` (filtered count, no row materialization) reaches ~314M rows/s on numeric predicates (~166× the pure-Python path)
 - **Bitmask Queries** 🔥 *(v0.10.0)* — `select_bitmask()` evaluates `(value >> pos) & 1` predicates on integer columns with AND / OR / XOR combination semantics; routes around the comparison operators when the predicate is naturally bit-level (flags, parity, presence masks)
 - **Low memory footprint** — ~2.2 MB / 100K rows vs. 2.9 MB for SQLite, 11 MB for pandas, 22 MB for a plain `dict` ([benchmarks](#benchmarks))
@@ -656,6 +658,47 @@ The following are intentional non-goals; they will not be added:
 - Targeted helper improvements (batch paths, range windows, zero-copy buffers) where they reduce per-row overhead without adding dependencies
 - Copy-on-write snapshots (O(1), incremental) as a successor to the current full-copy `snapshot()`
 - Reactive queries (`db.watch(query, callback)`) driven off CDC events
+
+## Vector Search (v0.17.0)
+
+Zero-dependency nearest-neighbor retrieval for agent memory, semantic caches, and RAG embedding lookup. Flat (brute-force) scan — deterministic recall, no build step, no approximation surprises in tests.
+
+```python
+from snapdb import VectorIndex
+
+idx = VectorIndex(metric="cosine")        # or "dot" / "euclidean"
+idx.add("doc-1", [0.1, 0.2, 0.3, 0.4])
+idx.add("doc-2", [0.5, 0.1, 0.0, 0.9])
+idx.add("doc-3", [0.08, 0.21, 0.31, 0.39])
+
+idx.search([0.1, 0.2, 0.3, 0.4], k=2)
+# [('doc-1', 0.9998...), ('doc-3', 0.9996...)]
+```
+
+**Options:**
+
+- `normalize_on_add=True` — L2-normalize vectors on insert so `dot` behaves identically to cosine on unit vectors (skip per-query norm work when callers pass raw model outputs).
+- `dim=N` — validate vector length at insert time; raises `ValueError` on mismatch.
+
+**API:**
+
+- `add(id, vector)` — upsert; duplicate id replaces.
+- `extend([(id, vec), ...])` — bulk add, returns count inserted.
+- `remove(id)` — returns True if removed.
+- `clear()` — drop all vectors.
+- `search(query, k=5)` — top-k `(id, score)` sorted descending (for `euclidean`, distances are negated internally so a single descending sort works for all three metrics).
+- `to_dict()` / `from_dict()` — JSON-safe serialization for disk persistence.
+- `size`, `dim`, `__len__` — introspection.
+
+**Performance:** For 1k vectors at dim 384, brute-force cosine is ~5ms on a laptop — fast enough for the agent retrieval loop. For larger corpora (≥50k vectors), swap in any external FAISS / OpenSearch backend while keeping the same API.
+
+**Compose with the rest of the tiny-* family:**
+
+- `tiny-prompt-cache` — store prompt prefixes by their embedding's nearest-neighbor id.
+- `tiny-semantic-cache` — deduplicate similar LLM calls.
+- `tiny-tool-cache` — cache tool-call results by their parameter embeddings.
+
+---
 
 ## License
 
