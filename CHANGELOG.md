@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-18
+
+### Added
+
+- **Index-aware query planning** — `Query.filter()` now consults
+  `HashIndex` (equality) and `RangeIndex` (`gt`/`gte`/`lt`/`lte`) before
+  falling back to a full table scan. A single indexed column turns a
+  filter from O(n) into O(log n + k); measured 31.5× speedup on a 50K-row
+  narrow range scan.
+- `Query.between(column, low, high, include_low=True, include_high=True)`
+  — readable shortcut for an inclusive range filter; consults the same
+  `RangeIndex` as the underlying `filter({col: {"gte": low, "lte": high}})`.
+- `Query.explain()` — returns a one-line description of the chosen
+  execution plan (`HashIndex[col = v]`, `RangeIndex[col (low, high)]`,
+  `Scan(filter=[...])`, `Scan(full)`). Never executes the predicate;
+  useful for verifying plans before the expensive part of a query.
+- `_plan_query(db, conditions)` — public helper that returns
+  `(plan, predicate)`. Useful for tooling that wants to inspect plans
+  without running the query.
+
+### Changed
+
+- `Query` carries an internal `where_conditions` dict so the planner can
+  re-plan on every `execute()` (queries are immutable; no cache needed).
+- `Query.where_fn()` clears the `where_conditions` cache — custom
+  predicates cannot be served from any index, so the planner falls back
+  to a scan.
+- `_iter_matching_values` (used by `sum`/`min`/`max`/`avg`/
+  `count_distinct`) is now index-aware when the index planner finds a
+  single-column range/equality condition.
+
+### Performance
+
+- 31.5× speedup on `range` predicate (50K rows, 500 matches).
+- 27.1× speedup on `eq` predicate via HashIndex lookup.
+
 ## [0.17.0] - 2026-09-25
 
 ### Added

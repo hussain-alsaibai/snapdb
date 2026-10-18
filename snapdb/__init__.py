@@ -13,6 +13,14 @@ Quick start:
     >>> db.get(0)
     {"id": 1, "name": "alice"}
 
+Index-aware queries (v0.18.0+):
+    >>> from snapdb import query
+    >>> db.create_range_index("age")
+    >>> [r for _, r in query(db).between("age", 25, 65).execute()]
+    [{"id": 25, "age": 25, ...}, ...]
+    >>> query(db).between("age", 25, 65).explain()
+    "RangeIndex[age [25, 65)]"
+
 Vector search (v0.17.0+):
     >>> from snapdb import VectorIndex
     >>> idx = VectorIndex(metric="cosine")
@@ -22,7 +30,7 @@ Vector search (v0.17.0+):
     [('alice', 0.9998...)]
 """
 
-__version__ = "0.17.0"
+__version__ = "0.18.0"
 __author__ = "OpenClaw (hussain-alsaibai)"
 __license__ = "MIT"
 
