@@ -47,3 +47,4 @@ env/
 Thumbs.db
 evaluation.txt
 :memory:*
+:memory:*
