@@ -7,6 +7,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-18
+
+### Added
+
+- **Index-aware query planning** — `Query.filter()` now consults
+  `HashIndex` (equality) and `RangeIndex` (`gt`/`gte`/`lt`/`lte`) before
+  falling back to a full table scan. A single indexed column turns a
+  filter from O(n) into O(log n + k); measured 31.5× speedup on a 50K-row
+  narrow range scan.
+- `Query.between(column, low, high, include_low=True, include_high=True)`
+  — readable shortcut for an inclusive range filter; consults the same
+  `RangeIndex` as the underlying `filter({col: {"gte": low, "lte": high}})`.
+- `Query.explain()` — returns a one-line description of the chosen
+  execution plan (`HashIndex[col = v]`, `RangeIndex[col (low, high)]`,
+  `Scan(filter=[...])`, `Scan(full)`). Never executes the predicate;
+  useful for verifying plans before the expensive part of a query.
+- `_plan_query(db, conditions)` — public helper that returns
+  `(plan, predicate)`. Useful for tooling that wants to inspect plans
+  without running the query.
+
+### Changed
+
+- `Query` carries an internal `where_conditions` dict so the planner can
+  re-plan on every `execute()` (queries are immutable; no cache needed).
+- `Query.where_fn()` clears the `where_conditions` cache — custom
+  predicates cannot be served from any index, so the planner falls back
+  to a scan.
+- `_iter_matching_values` (used by `sum`/`min`/`max`/`avg`/
+  `count_distinct`) is now index-aware when the index planner finds a
+  single-column range/equality condition.
+
+### Performance
+
+- 31.5× speedup on `range` predicate (50K rows, 500 matches).
+- 27.1× speedup on `eq` predicate via HashIndex lookup.
+
+## [0.17.0] - 2026-09-25
+
+### Added
+
+- **Vector similarity search** (`VectorIndex`) — flat (brute-force) nearest-
+  neighbor index with three zero-dependency distance metrics: `cosine`
+  (default), `dot`, and `euclidean`. Public primitives `cosine_similarity`,
+  `dot_product`, `euclidean_distance` are also exported for standalone use.
+  - `add(id, vector)`, `extend([(id, vec), ...])`, `remove(id)`, `clear()`
+  - `search(query, k=5)` returns top-k `(id, score)` sorted descending
+    (for `euclidean`, distances are negated internally so a single
+    descending sort works for all three metrics).
+  - Optional `normalize_on_add=True` L2-normalizes vectors on insert so
+    `dot` behaves identically to cosine on unit vectors (skipping the
+    per-query norm computation when callers pass raw model outputs).
+  - Optional `dim=N` validates vector length at insert time.
+  - Duplicate ids REPLACE the prior vector (idempotent upsert semantics).
+  - Thread-safe for concurrent reads after bulk inserts (RLock around
+    writes).
+  - `to_dict()` / `from_dict()` JSON-safe serialization for disk persistence
+    or network transport.
+  - Zero-vector queries return `0.0` rather than `NaN` (deterministic).
+
+  Designed for small-to-medium corpora (≤ ~50k vectors per index) where
+  the simplicity of a flat scan beats the complexity of HNSW / IVF. For
+  larger corpora, swap in any external FAISS / OpenSearch backend while
+  keeping the same API.
+
+  Use case: agent memory retrieval, semantic cache lookup, RAG embedding
+  nearest-neighbor, deduplication of tool results. Composes with
+  `tiny-prompt-cache`, `tiny-semantic-cache`, `tiny-tool-cache`.
+
+### Tests
+
+- New `tests/test_v017_vector.py` — 36 tests covering distance primitives,
+  metric validation, dim checking, search ranking for all three metrics,
+  replacement / bulk-add / remove / clear, normalize-on-add round-trip,
+  JSON serialization round-trip, concurrent adds (4 threads × 100 vectors),
+  and a real-world agent-memory retrieval pattern. Full suite now passes.
+
+## [0.16.1] - 2026-09-20
+
+### Added
+
+- **Aggregations** (`ColumnarTable.aggregate`) — `sum`, `min`, `max`, `avg`,
+  `count_distinct` over numeric columns with optional `where=` predicate.
+  Returns a flat dict (`{column: value}`) or `None` for empty filtered
+  sets.
+- **CHANGELOG hygiene** — cleanup of stray `:memory:` artifacts from git
+  index.
+
+## [0.16.0] - 2026-09-08
+
+### Added
+
+- **`llms.txt` manifest** at the repo root for agent-native discovery.
+
 ## [0.15.0.dev0] - 2026-07-23
 
 ### Added
