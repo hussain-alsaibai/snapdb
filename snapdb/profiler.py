@@ -14,6 +14,14 @@ The profiler hooks into PY_START and PY_RETURN events on the core
 `select_where`, `aggregate`, `insert`, `update`, `delete`, and `get`
 entry points, accumulating call counts and wall/CPU time per operation.
 Overhead is ~5% when active, zero when not imported.
+
+Version notes
+-------------
+`sys.monitoring.TOOL_AUGMENTATION` does not exist in CPython 3.12, 3.13 or
+3.14 -- the only reserved tool ids are DEBUGGER_ID (0), COVERAGE_ID (1),
+PROFILER_ID (2) and OPTIMIZER_ID (5), and each is owned by the interpreter.
+The remaining ids (3 and 4) are free for third-party tools, so this module
+claims one with `monitoring.use_tool_id()`.
 """
 
 from __future__ import annotations
@@ -32,9 +40,41 @@ _HAVE_MONITORING = sys.version_info >= (3, 12)
 
 if _HAVE_MONITORING:
     from sys import monitoring
-    _TOOL_ID = monitoring.TOOL_AUGMENTATION  # piggyback on any active tool
-else:
-    _TOOL_ID = None  # type: ignore[assignment]
+else:  # pragma: no cover — import guard
+    monitoring = None  # type: ignore[assignment]
+
+# Tool ids 0/1/2/5 are reserved for the interpreter (debugger, coverage,
+# profiler, optimizer). Ids 3 and 4 are free for third-party tools.
+_CANDIDATE_TOOL_IDS = (3, 4)
+
+
+def _claim_tool_id() -> int | None:
+    """Claim a free `sys.monitoring` tool id, or return None.
+
+    A tool id can only be claimed once per process, so the first successful
+    claim is cached at module level. If every candidate is already taken by
+    another library, profiling is unavailable and the profiler degrades to a
+    no-op rather than raising.
+    """
+    if not _HAVE_MONITORING:
+        return None
+    for candidate in _CANDIDATE_TOOL_IDS:
+        try:
+            monitoring.use_tool_id(candidate, "snapdb-profiler")
+        except ValueError:
+            # Already in use by someone else — try the next candidate.
+            continue
+        return candidate
+    return None
+
+
+_TOOL_ID = _claim_tool_id()
+
+
+def _has_monitoring() -> bool:
+    """True when a usable `sys.monitoring` tool id was claimed."""
+    return _TOOL_ID is not None
+
 
 # ---------------------------------------------------------------------------
 # Profiled operations
@@ -93,7 +133,7 @@ class QueryProfiler:
         self._cpu_times: dict[str, list[float]] = defaultdict(list)
         self._active_calls: dict[int, tuple[str, float]] = {}  # frame_id → (name, start)
 
-        if _HAVE_MONITORING:
+        if _has_monitoring():
             self._setup_callbacks()
         else:
             self._py_start: Callable[..., Any] = self._noop_callback
@@ -112,7 +152,7 @@ class QueryProfiler:
 
     def enable(self) -> None:
         """Start profiling. Thread-safe (idempotent)."""
-        if not _HAVE_MONITORING:
+        if not _has_monitoring():
             return
         with self._lock:
             if self._enabled:
@@ -128,6 +168,12 @@ class QueryProfiler:
                     monitoring.events.PY_RETURN,
                     self._py_return,
                 )
+                # register_callback() alone does nothing — events must be
+                # explicitly enabled for this tool id or no callback fires.
+                monitoring.set_events(
+                    _TOOL_ID,
+                    monitoring.events.PY_START | monitoring.events.PY_RETURN,
+                )
                 self._enabled = True
             except Exception:
                 # Another tool may already own the callbacks — skip profiling
@@ -135,12 +181,13 @@ class QueryProfiler:
 
     def disable(self) -> None:
         """Stop profiling. Thread-safe."""
-        if not _HAVE_MONITORING:
+        if not _has_monitoring():
             return
         with self._lock:
             if not self._enabled:
                 return
             try:
+                monitoring.set_events(_TOOL_ID, monitoring.events.NO_EVENTS)
                 monitoring.register_callback(_TOOL_ID, monitoring.events.PY_START, None)
                 monitoring.register_callback(_TOOL_ID, monitoring.events.PY_RETURN, None)
             except Exception:
@@ -154,27 +201,40 @@ class QueryProfiler:
         pass
 
     def _setup_callbacks(self) -> None:
-        """Set up PY_START / PY_RETURN callbacks via sys.monitoring."""
+        """Set up PY_START / PY_RETURN callbacks via sys.monitoring.
+
+        PEP 669 passes a *code object* as the first argument to PY_START and
+        PY_RETURN — not a frame. The frame has to be recovered with
+        `sys._getframe(1)` so that PY_START and PY_RETURN can be paired by
+        frame identity.
+        """
 
         def py_start(
-            frame: Any,
+            code: Any,
             instruction_offset: int,
         ) -> None:
-            code = frame.f_code
             name = code.co_name
-            if name in _PROFILED_NAMES:
-                fid = id(frame)
-                self._active_calls[fid] = (name, time.perf_counter())
+            if name not in _PROFILED_NAMES:
+                return
+            try:
+                frame = sys._getframe(1)
+            except ValueError:  # pragma: no cover — frame gone
+                return
+            self._active_calls[id(frame)] = (name, time.perf_counter())
 
         def py_return(
-            frame: Any,
+            code: Any,
             instruction_offset: int,
             retval: Any,
         ) -> None:
-            fid = id(frame)
-            if fid not in self._active_calls:
+            try:
+                frame = sys._getframe(1)
+            except ValueError:  # pragma: no cover — frame gone
                 return
-            name, start = self._active_calls.pop(fid)
+            entry = self._active_calls.pop(id(frame), None)
+            if entry is None:
+                return
+            name, start = entry
             elapsed = time.perf_counter() - start
             with self._lock:
                 self._counts[name] += 1
@@ -213,6 +273,13 @@ class QueryProfiler:
                 "Profiling is not available on this Python version."
             )
 
+        if not _has_monitoring():
+            return (
+                "[QueryProfiler] No free sys.monitoring tool id was available "
+                "(ids 3 and 4 are claimed by other libraries). "
+                "Profiling is not available in this process."
+            )
+
         stats = self.stats()
         if not stats:
             return "[QueryProfiler] No data — did you call enable() and run some queries?"
@@ -232,7 +299,7 @@ class QueryProfiler:
                 f"{s['total_s']:>10.4f} "
                 f"{mean_ms:>10.2f} "
                 f"{p95_ms:>10.2f} "
-                f"{max_ms:>10.2f}"
+                f"{max_ms:>10.2f} "
             )
 
         lines.append("=" * 64)
@@ -252,6 +319,8 @@ class QueryProfiler:
     def __repr__(self) -> str:
         if not _HAVE_MONITORING:
             return f"<QueryProfiler (Python {sys.version_info.major}.{sys.version_info.minor} — monitoring unavailable)>"
+        if not _has_monitoring():
+            return "<QueryProfiler (no free monitoring tool id)>"
         status = "active" if self._enabled else "inactive"
         total = sum(self._counts.values())
         return f"<QueryProfiler [{status}] {total} calls>"

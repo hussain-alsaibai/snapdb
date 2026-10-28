@@ -16,13 +16,12 @@ Covers:
 """
 from __future__ import annotations
 
-import os
 import tempfile
 import unittest
 from pathlib import Path
 
 from snapdb.core import SnapDB, Schema, ColumnDef
-from snapdb.query import Query, query, _plan_query, _execute_plan
+from snapdb.query import query, _plan_query
 
 
 def _build_db(n: int = 100):
