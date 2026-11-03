@@ -52,44 +52,66 @@ SnapDB is purpose-built for the **durable state** and **audit trail** needs of a
 
 ### Pattern 1: State Snapshotting
 
-Agents maintain complex in-memory state (conversation history, tool results, pending tasks). SnapDB's memory-mapped snapshots let you atomically save and restore entire agent state in milliseconds — no serialization overhead.
+Agents maintain complex in-memory state (conversation history, tool results, pending tasks). SnapDB's named snapshots let you atomically save and restore entire agent state in milliseconds — no serialization overhead.
 
 ```python
-from snapdb import SnapDB
+from snapdb import SnapDB, Schema, ColumnDef
 
-db = SnapDB()
-store = db.memory_store("agent_state")
+schema = Schema([
+    ColumnDef("state", "bytes:32"),
+    ColumnDef("current_task", "bytes:64"),
+    ColumnDef("steps_taken", "i32"),
+    ColumnDef("tokens_spent", "i64"),
+])
+
+db = SnapDB("agent_state.snap", schema)
 
 # Agent working state
-store.insert(state="planning", current_task="fix-auth-bug", steps_taken=12, tokens_spent=84000)
+db.insert({
+    "state": "planning",
+    "current_task": "fix-auth-bug",
+    "steps_taken": 12,
+    "tokens_spent": 84000,
+})
 
 # Snapshot — save to disk
-db.snapshot()
+name = db.snapshot()
 
-# Agent crashes → restart → restore in <10ms
-db.restore()
-current = store.all()
+# Agent crashes → restart → restore from the named snapshot
+restored = db.open_snapshot(name)
+current = restored.find(state="planning")
 print(current[-1])  # back where you left off
 ```
 
 ### Pattern 2: Audit Trail
 
-Every autonomous decision should be logged durably. SnapDB's row store is append-only and crash-safe.
+Every autonomous decision should be logged durably. SnapDB's row store is crash-safe and survives an abrupt process exit.
 
 ```python
-audit = db.row_store("decisions")
+from snapdb import SnapDB, Schema, ColumnDef
 
-audit.insert(
-    agent_id="openclaw-main",
-    action="open_pr",
-    target="hussain-alsaibai/repo#42",
-    reasoning="Bug described in issue matches stack trace in error logs",
-    outcome="pr_opened",
-    timestamp=datetime.now().isoformat()
-)
+schema = Schema([
+    ColumnDef("agent_id", "bytes:32"),
+    ColumnDef("action", "bytes:16"),
+    ColumnDef("target", "bytes:64"),
+    ColumnDef("reasoning", "bytes:128"),
+    ColumnDef("outcome", "bytes:16"),
+    ColumnDef("ts", "i64"),
+])
 
-# Query: what did the agent do in the last hour?
-recent = audit.select_where("outcome == 'pr_opened'")
+audit = SnapDB("decisions.snap", schema, storage_type="row")
+
+audit.insert({
+    "agent_id": "openclaw-main",
+    "action": "open_pr",
+    "target": "hussain-alsaibai/repo#42",
+    "reasoning": "Bug described in issue matches stack trace in error logs",
+    "outcome": "pr_opened",
+    "ts": 1730000000,
+})
+
+# Query: what did the agent do?
+recent = audit.find(action="open_pr")
 ```
 
 ### Pattern 3: Tool Call Memory
@@ -97,16 +119,24 @@ recent = audit.select_where("outcome == 'pr_opened'")
 Cache tool results to avoid re-fetching. Columnar engine handles 100K+ entries at full-scan speed.
 
 ```python
-tool_cache = db.columnar_store("tool_results")
+from snapdb import ColumnarTable
 
-# Columnar for high-throughput reads
-tool_cache.create_column("tool", "str")
-tool_cache.create_column("args_hash", "str")
-tool_cache.create_column("result_preview", "str", max_size=200)
-tool_cache.create_column("called_at", "f8")
+tool_cache = ColumnarTable(
+    "tool_results",
+    [
+        ("tool", "bytes:48"),
+        ("args_hash", "bytes:32"),
+        ("result_preview", "bytes:200"),
+        ("called_at", "f64"),
+    ],
+)
 
-tool_cache.insert(["fetch_github_issue", "abc123", "..."],
-                   ["fetch_github_issue", "def456", "..."])
+tool_cache.insert({
+    "tool": "fetch_github_issue",
+    "args_hash": "abc123",
+    "result_preview": "...",
+    "called_at": 1730000000.0,
+})
 ```
 
 ### Pattern 4: Context Compression
@@ -115,13 +145,13 @@ Use the columnar analytics engine to compress agent history into summary stats f
 
 ```python
 # What tools does this agent call most?
-top_tools = store.aggregate("tool_name", "count", top_k=5)
+top_tools = tool_cache.aggregate("tool", "count")
 
 # Average tokens per session?
-avg_tokens = store.aggregate("tokens_used", "mean")
+avg_tokens = tool_cache.aggregate("tokens_used", "avg")
 
 # Failed operations by type?
-failures = store.select_where("outcome == 'error'").group_by("error_type")
+failures = tool_cache.group_by("outcome", "error_type")
 ```
 
 ### Comparison: SnapDB vs Alternatives for Agent Memory
