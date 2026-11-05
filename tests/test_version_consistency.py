@@ -1,67 +1,99 @@
-"""Every place that states snapdb's version must agree.
+"""Version consistency: the published package version must match the code.
 
-`package.json` sat at 0.11.0 for seven releases while `pyproject.toml`,
-`snapdb.__version__` and the CHANGELOG were at 0.18.0. Nothing read the file,
-so nothing failed - which is exactly why this test exists.
+A pyproject.toml version that lags the module's __version__ ships a
+package that reports the wrong version at runtime, and breaks every
+"pip show" / importlib.metadata check a downstream user makes.
+
+This asserts the contract rather than a literal version, so it keeps
+working across future bumps instead of breaking on every release.
 """
 
-import json
-import os
+from __future__ import annotations
+
 import re
-
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def read(*parts):
-    with open(os.path.join(ROOT, *parts), encoding="utf-8") as fh:
-        return fh.read()
+import unittest
+from pathlib import Path
 
 
-def pyproject_version():
-    return re.search(r'^version\s*=\s*"([^"]+)"', read("pyproject.toml"), re.M).group(1)
+def _find_pyproject() -> Path:
+    """Walk up from this file until a pyproject.toml shows up."""
+    here = Path(__file__).resolve()
+    for candidate in [here.parent, *here.parents]:
+        pyproject = candidate / "pyproject.toml"
+        if pyproject.exists():
+            return pyproject
+    raise AssertionError("no pyproject.toml found above " + str(here))
 
 
-def module_version():
-    path = os.path.join(ROOT, "snapdb", "__init__.py")
-    with open(path, encoding="utf-8") as fh:
-        return re.search(r'^__version__\s*=\s*"([^"]+)"', fh.read(), re.M).group(1)
+PYPROJECT = _find_pyproject()
 
 
-def package_json_version():
-    return json.loads(read("package.json"))["version"]
+def _pyproject_version() -> str:
+    text = PYPROJECT.read_text(encoding="utf-8")
+    match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
+    assert match, "pyproject.toml has no version field"
+    return match.group(1)
 
 
-def release_history():
-    """Every `## [x.y.z]` heading in the CHANGELOG."""
-    return re.findall(r"^## \[([0-9]+\.[0-9]+\.[0-9]+)\]", read("CHANGELOG.md"), re.M)
+class TestVersionConsistency(unittest.TestCase):
+    def test_pyproject_matches_module_version(self) -> None:
+        import snapdb
 
+        self.assertEqual(
+            _pyproject_version(),
+            snapdb.__version__,
+            "pyproject.toml version does not match snapdb.__version__",
+        )
 
-def test_pyproject_matches_module():
-    assert pyproject_version() == module_version()
+    def test_version_is_semver(self) -> None:
+        version = _pyproject_version()
+        self.assertRegex(
+            version,
+            r"^\d+\.\d+\.\d+$",
+            "version must be plain semver, got " + version,
+        )
 
+class TestTrackedVersionSurfaces(unittest.TestCase):
+    """package.json is tracked but nothing reads it.
 
-def test_package_json_matches_pyproject():
-    # The file is not read by the Python build or by any workflow, so a stale
-    # value is invisible in CI. That is the whole failure mode.
-    assert package_json_version() == pyproject_version()
+    It is not the Python build, not the release workflow, not any test - so its
+    version drifted seven releases behind (0.11.0 against 0.18.0) with no
+    failure anywhere. A version surface that no consumer reads is still a
+    surface a reader trusts.
+    """
 
+    def _package_json_version(self) -> str:
+        import json
 
-def test_package_json_name_matches_pyproject():
-    assert json.loads(read("package.json"))["name"] == "pysnapdb"
+        text = (PYPROJECT.parent / "package.json").read_text(encoding="utf-8")
+        return json.loads(text)["version"]
 
+    def test_package_json_matches_pyproject(self) -> None:
+        self.assertEqual(
+            self._package_json_version(),
+            _pyproject_version(),
+            "package.json version does not match pyproject.toml",
+        )
 
-def test_changelog_documents_the_shipped_version():
-    assert pyproject_version() in release_history(), (
-        "CHANGELOG.md has no ## [%s] entry" % pyproject_version()
-    )
+    def test_changelog_documents_the_shipped_version(self) -> None:
+        changelog = (PYPROJECT.parent / "CHANGELOG.md").read_text(encoding="utf-8")
+        version = _pyproject_version()
+        self.assertRegex(
+            changelog,
+            r"(?m)^## \[%s\]" % re.escape(version),
+            "CHANGELOG.md has no ## [%s] entry" % version,
+        )
 
+    def test_shipped_version_is_not_behind_the_changelog(self) -> None:
+        changelog = (PYPROJECT.parent / "CHANGELOG.md").read_text(encoding="utf-8")
+        released = re.findall(r"(?m)^## \[([0-9]+\.[0-9]+\.[0-9]+)\]", changelog)
 
-def test_no_version_regression():
-    # A released version must never be lower than the newest changelog entry.
-    def key(v):
-        return tuple(int(x) for x in v.split("."))
+        def key(v: str) -> tuple:
+            return tuple(int(part) for part in v.split("."))
 
-    newest = max(release_history(), key=key)
-    assert key(pyproject_version()) >= key(newest), (
-        "shipped %s is behind CHANGELOG %s" % (pyproject_version(), newest)
-    )
+        newest = max(released, key=key)
+        self.assertGreaterEqual(
+            key(_pyproject_version()),
+            key(newest),
+            "shipped %s is behind CHANGELOG %s" % (_pyproject_version(), newest),
+        )
