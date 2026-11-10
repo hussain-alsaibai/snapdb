@@ -48,3 +48,8 @@ Thumbs.db
 evaluation.txt
 :memory:*
 :memory:*
+
+# Lock files and snapshot dirs created by local runs
+*.snap.lock
+*.wal.lock
+*.snapshots/
