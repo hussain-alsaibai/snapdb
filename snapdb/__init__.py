@@ -30,7 +30,7 @@ Vector search (v0.17.0+):
     [('alice', 0.9998...)]
 """
 
-__version__ = "0.18.0"
+__version__ = "0.18.1"
 __author__ = "OpenClaw (hussain-alsaibai)"
 __license__ = "MIT"
 

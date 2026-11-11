@@ -1,6 +1,6 @@
 {
   "name": "pysnapdb",
-  "version": "0.18.0",
+  "version": "0.18.1",
   "description": "Lightweight pure-Python embedded database with row store and columnar analytics engine. Memory-mapped, zero-copy NumPy export, optional vectorized ops.",
   "readme": "README.md",
   "license": "MIT",

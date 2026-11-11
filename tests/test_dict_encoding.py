@@ -8,7 +8,7 @@ from snapdb import ColumnarTable
 PASS = 0
 FAIL = 0
 
-def test(name, ok, detail=""):
+def check(name, ok, detail=""):
     global PASS, FAIL
     if ok:
         PASS += 1
@@ -41,30 +41,30 @@ def test_dict_encoding():
     ]
 
     db.batch_insert(rows)
-    test("batch_insert 5 rows", len(db) == 5)
+    check("batch_insert 5 rows", len(db) == 5)
 
     # Verify dict mode is active
     status_col = db.columns["status"]
     category_col = db.columns["category"]
-    test("status dict mode active", status_col._dict_mode and not status_col._dict_fallback)
-    test("category dict mode active", category_col._dict_mode and not category_col._dict_fallback)
+    check("status dict mode active", status_col._dict_mode and not status_col._dict_fallback)
+    check("category dict mode active", category_col._dict_mode and not category_col._dict_fallback)
 
     # Verify data integrity
     row0 = db.get(0)
-    test("row 0 status", row0["status"] == "active")
-    test("row 0 category", row0["category"] == "electronics")
+    check("row 0 status", row0["status"] == "active")
+    check("row 0 category", row0["category"] == "electronics")
 
     row1 = db.get(1)
-    test("row 1 status", row1["status"] == "inactive")
-    test("row 1 category", row1["category"] == "electronics")
+    check("row 1 status", row1["status"] == "inactive")
+    check("row 1 category", row1["category"] == "electronics")
 
     row3 = db.get(3)
-    test("row 3 status", row3["status"] == "pending")
-    test("row 3 category", row3["category"] == "electronics")
+    check("row 3 status", row3["status"] == "pending")
+    check("row 3 category", row3["category"] == "electronics")
 
     # Verify unique count
-    test("status unique count", status_col.unique_count() == 3)
-    test("category unique count", category_col.unique_count() == 2)
+    check("status unique count", status_col.unique_count() == 3)
+    check("category unique count", category_col.unique_count() == 2)
 
     # Verify memory is lower than raw
     dict_mem = db.memory_usage()
@@ -75,22 +75,22 @@ def test_dict_encoding():
         db2.insert(row)
     raw_mem = db2.memory_usage()
 
-    test("dict memory < raw memory", dict_mem < raw_mem,
+    check("dict memory < raw memory", dict_mem < raw_mem,
          f"dict={dict_mem}B raw={raw_mem}B")
 
     # Verify select works
     active = db.select(where=lambda r: r["status"] == "active")
-    test("select active", len(active) == 3)
-    test("select active row 0", active[0]["status"] == "active")
+    check("select active", len(active) == 3)
+    check("select active row 0", active[0]["status"] == "active")
 
     # Verify update works with dict
     db.update(1, {"status": "active"})
     row1 = db.get(1)
-    test("update status", row1["status"] == "active")
+    check("update status", row1["status"] == "active")
 
     # Verify iter_valid
     statuses = [v for _, v in status_col.iter_valid()]
-    test("iter_valid", len(statuses) == 5)
+    check("iter_valid", len(statuses) == 5)
 
     # Test dict fallback on threshold overflow
     print("\n  ━─ Test dict fallback ──")
@@ -102,11 +102,11 @@ def test_dict_encoding():
         db3.insert({"id": i, "name": f"user_{i}_very_long_name"})
 
     name_col = db3.columns["name"]
-    test("fallback occurred", name_col._dict_fallback or not name_col._dict_mode)
+    check("fallback occurred", name_col._dict_fallback or not name_col._dict_mode)
 
     # Verify data still correct after fallback
     row = db3.get(2)
-    test("fallback data correct", row["name"] == "user_2_very_long_name")
+    check("fallback data correct", row["name"] == "user_2_very_long_name")
 
 
 def test_dict_no_encode():
@@ -118,8 +118,8 @@ def test_dict_no_encode():
     db.insert({"id": 2, "name": "bob"})
 
     name_col = db.columns["name"]
-    test("no dict mode", not name_col._dict_mode)
-    test("raw data", db.get(0)["name"] == "alice")
+    check("no dict mode", not name_col._dict_mode)
+    check("raw data", db.get(0)["name"] == "alice")
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ from snapdb import ColumnarTable
 PASS = 0
 FAIL = 0
 
-def test(name, ok, detail=""):
+def check(name, ok, detail=""):
     global PASS, FAIL
     if ok:
         PASS += 1
@@ -43,30 +43,30 @@ def test_delta_encoding():
         })
 
     db.batch_insert(rows)
-    test("batch_insert 100 rows", len(db) == 100)
+    check("batch_insert 100 rows", len(db) == 100)
 
     # Verify delta mode is active
     ts_col = db.columns["timestamp"]
     seq_col = db.columns["seq"]
-    test("timestamp delta mode active", ts_col._delta_mode and not ts_col._delta_fallback)
-    test("seq delta mode active", seq_col._delta_mode and not seq_col._delta_fallback)
+    check("timestamp delta mode active", ts_col._delta_mode and not ts_col._delta_fallback)
+    check("seq delta mode active", seq_col._delta_mode and not seq_col._delta_fallback)
 
     # Verify data integrity
     row0 = db.get(0)
-    test("row 0 timestamp", row0["timestamp"] == base_ts)
-    test("row 0 seq", row0["seq"] == 0)
+    check("row 0 timestamp", row0["timestamp"] == base_ts)
+    check("row 0 seq", row0["seq"] == 0)
 
     row50 = db.get(50)
-    test("row 50 timestamp", row50["timestamp"] == base_ts + 50 * 1000)
-    test("row 50 seq", row50["seq"] == 50)
+    check("row 50 timestamp", row50["timestamp"] == base_ts + 50 * 1000)
+    check("row 50 seq", row50["seq"] == 50)
 
     row99 = db.get(99)
-    test("row 99 timestamp", row99["timestamp"] == base_ts + 99 * 1000)
-    test("row 99 seq", row99["seq"] == 99)
+    check("row 99 timestamp", row99["timestamp"] == base_ts + 99 * 1000)
+    check("row 99 seq", row99["seq"] == 99)
 
     # Verify non-delta column
     id_col = db.columns["id"]
-    test("id not delta mode", not id_col._delta_mode)
+    check("id not delta mode", not id_col._delta_mode)
 
     # Verify memory is lower than raw
     delta_mem = db.memory_usage()
@@ -77,18 +77,18 @@ def test_delta_encoding():
         db2.insert(row)
     raw_mem = db2.memory_usage()
 
-    test("delta memory < raw memory", delta_mem < raw_mem,
+    check("delta memory < raw memory", delta_mem < raw_mem,
          f"delta={delta_mem}B raw={raw_mem}B")
 
     # Verify select works
     result = db.select(where=lambda r: r["seq"] > 50)
-    test("select seq > 50", len(result) == 49)
-    test("select correct", result[0]["seq"] == 51)
+    check("select seq > 50", len(result) == 49)
+    check("select correct", result[0]["seq"] == 51)
 
     # Verify iter_valid
     ts_vals = [v for _, v in ts_col.iter_valid()]
-    test("iter_valid timestamps", len(ts_vals) == 100)
-    test("iter_valid first", ts_vals[0] == base_ts)
+    check("iter_valid timestamps", len(ts_vals) == 100)
+    check("iter_valid first", ts_vals[0] == base_ts)
 
 
 def test_delta_fallback():
@@ -103,13 +103,13 @@ def test_delta_fallback():
         db.insert({"id": i, "score": i if i % 2 == 0 else i - 5})
 
     score_col = db.columns["score"]
-    test("fallback occurred", score_col._delta_fallback)
+    check("fallback occurred", score_col._delta_fallback)
 
     # Verify data still correct after fallback
     for i in range(60):
         row = db.get(i)
         expected = i if i % 2 == 0 else i - 5
-        test(f"fallback data row {i}", row["score"] == expected, f"got {row['score']} expected {expected}")
+        check(f"fallback data row {i}", row["score"] == expected, f"got {row['score']} expected {expected}")
 
 
 def test_delta_not_triggered():
@@ -126,9 +126,9 @@ def test_delta_not_triggered():
     # With only 10 rows, still in sampling phase (not delta yet)
     # Actually, we need to check - with the current implementation,
     # delta mode is enabled after reaching delta_samples
-    test("still sampling", not ts_col._delta_mode)
-    test("not fallback", not ts_col._delta_fallback)
-    test("data correct", db.get(5)["ts"] == 1500)
+    check("still sampling", not ts_col._delta_mode)
+    check("not fallback", not ts_col._delta_fallback)
+    check("data correct", db.get(5)["ts"] == 1500)
 
 
 if __name__ == "__main__":

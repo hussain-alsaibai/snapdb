@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.1] - 2026-11-11
+
+### Fixed
+
+- **The published sdist could not pass its own test suite.** Two defects,
+  both invisible in a checkout because a checkout has files an sdist does
+  not:
+  - `tests/test_version_consistency.py` read `CHANGELOG.md` and
+    `package.json` from the repo root, and neither was in the tarball →
+    2 `FileNotFoundError` failures for anyone who ran
+    `pip download pysnapdb --no-binary :all: && pytest`.
+  - `tests/test_delta_encoding.py` and `tests/test_dict_encoding.py` defined a
+    module-level helper `def test(name, ok, detail="")`. pytest collects that
+    as a test with a fixture called `name` → `fixture 'name' not found` on
+    every run, including ours. Renamed to `check()` (39 call sites).
+
+### Added
+
+- `MANIFEST.in` — ships `CHANGELOG.md` and `package.json` in the sdist.
+- `tests/test_module_level_api.py` — asserts that the files the suite reads
+  are in the sdist, that the sdist version matches `PKG-INFO`, and that no
+  test module defines a pytest-collectable helper named `test()`. The first
+  two skip in a checkout (they can only be true of a tarball); the third runs
+  everywhere.
+- Repo-metadata checks now `skipTest` instead of `FileNotFoundError` when the
+  file is absent from the sdist — the checkout still enforces them.
+
 ## [Unreleased]
 
 ## [0.18.0] - 2026-10-18

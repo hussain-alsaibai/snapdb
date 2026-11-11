@@ -60,13 +60,25 @@ class TestTrackedVersionSurfaces(unittest.TestCase):
     version drifted seven releases behind (0.11.0 against 0.18.0) with no
     failure anywhere. A version surface that no consumer reads is still a
     surface a reader trusts.
+
+    Both surfaces are *repo* metadata. ``package.json`` and ``CHANGELOG.md``
+    are not in the sdist, so inside an unpacked sdist (the bytes a user gets
+    from PyPI) these checks cannot run and must skip rather than fail. That is
+    not a licence to stop checking them: the checkout half of the same suite
+    still enforces both, and CI runs from a checkout.
     """
+
+    def _optional_text(self, name: str) -> str:
+        """Read a repo-root file, skipping when it is not in this distribution."""
+        path = PYPROJECT.parent / name
+        if not path.exists():
+            self.skipTest(f"{name} is not part of the sdist")
+        return path.read_text(encoding="utf-8")
 
     def _package_json_version(self) -> str:
         import json
 
-        text = (PYPROJECT.parent / "package.json").read_text(encoding="utf-8")
-        return json.loads(text)["version"]
+        return json.loads(self._optional_text("package.json"))["version"]
 
     def test_package_json_matches_pyproject(self) -> None:
         self.assertEqual(
@@ -76,7 +88,7 @@ class TestTrackedVersionSurfaces(unittest.TestCase):
         )
 
     def test_changelog_documents_the_shipped_version(self) -> None:
-        changelog = (PYPROJECT.parent / "CHANGELOG.md").read_text(encoding="utf-8")
+        changelog = self._optional_text("CHANGELOG.md")
         version = _pyproject_version()
         self.assertRegex(
             changelog,
@@ -85,7 +97,7 @@ class TestTrackedVersionSurfaces(unittest.TestCase):
         )
 
     def test_shipped_version_is_not_behind_the_changelog(self) -> None:
-        changelog = (PYPROJECT.parent / "CHANGELOG.md").read_text(encoding="utf-8")
+        changelog = self._optional_text("CHANGELOG.md")
         released = re.findall(r"(?m)^## \[([0-9]+\.[0-9]+\.[0-9]+)\]", changelog)
 
         def key(v: str) -> tuple:

@@ -1,0 +1,11 @@
+# Files the checkout has and the built sdist needs.
+#
+# CHANGELOG.md and package.json are repo-level version surfaces. The test
+# suite checks them, so an sdist that omits them ships a suite that cannot pass
+# on the bytes a user actually downloads — which is what happened in 0.18.0:
+# `pip download pysnapdb --no-binary :all:` then `pytest` gave 2 failures in
+# test_version_consistency.py, and the failures were invisible in the repo.
+include CHANGELOG.md
+include package.json
+include LICENSE
+recursive-include tests *.py
