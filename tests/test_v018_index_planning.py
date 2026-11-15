@@ -180,23 +180,37 @@ class TestExplain(_SnapTestCase):
 
     def test_explain_range_index_lt(self):
         self._db.create_range_index("age")
+        # Selective enough to be worth the index. The 100-row fixture spans
+        # age 0..49 twice, so `lte 5` is 12 rows (12% of the table). A
+        # single-sided bound over *most* of the table is rejected by the
+        # selectivity guard and is asserted separately below.
+        self.assertEqual(
+            query(self._db).filter(age={"lte": 5}).explain(),
+            "RangeIndex[age lte= 5]",
+        )
+
+    def test_explain_reports_rejected_index(self):
+        self._db.create_range_index("age")
+        # `lte 30` covers 62 of 100 rows - the index would be slower than a
+        # scan here, so explain() must say so rather than advertise a plan
+        # execute() will not use.
         self.assertEqual(
             query(self._db).filter(age={"lte": 30}).explain(),
-            "RangeIndex[age lte= 30]",
+            "Scan(filter=['age']) [index rejected: 62/100 rows]",
         )
 
     def test_explain_range_index_gt_exclusive(self):
         self._db.create_range_index("age")
         self.assertEqual(
-            query(self._db).filter(age={"gt": 25}).explain(),
-            "RangeIndex[age gt 25]",
+            query(self._db).filter(age={"gt": 45}).explain(),
+            "RangeIndex[age gt 45]",
         )
 
     def test_explain_between(self):
         self._db.create_range_index("age")
         self.assertEqual(
-            query(self._db).filter(age={"gte": 25, "lt": 65}).explain(),
-            "RangeIndex[age [25, 65)]",
+            query(self._db).filter(age={"gte": 25, "lt": 35}).explain(),
+            "RangeIndex[age [25, 35)]",
         )
 
     def test_explain_scan_when_no_index(self):

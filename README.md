@@ -195,7 +195,7 @@ failures = tool_cache.group_by("outcome", "error_type")
 - **Columnar engine** — column-oriented `array.array` storage; full-scan aggregation runs ~27× faster than SQLite at a fraction of the memory
 - **NumPy-accelerated aggregates** *(optional, v0.8.0)* — when NumPy is installed, `aggregate()` runs over the zero-copy column buffer (~530M rows/s, on par with pandas); pure-Python remains the zero-dependency default
 - **Vector similarity search** *(v0.17.0)* — `VectorIndex` with cosine / dot / Euclidean metrics, deterministic recall, JSON-safe serialization. Zero deps.
-- **Index-aware queries** 🔥 *(v0.18.0)* — `Query.filter()` consults `HashIndex` (eq) and `RangeIndex` (`gt`/`gte`/`lt`/`lte`) before scanning. `Query.between(low, high)` is the readable shortcut. `Query.explain()` returns the chosen plan. O(log n + k) instead of O(n) for selective predicates — measured 31.5× speedup on a 50K-row narrow range.
+- **Index-aware queries** 🔥 *(v0.18.0)* — `Query.filter()` consults `HashIndex` (eq) and `RangeIndex` (`gt`/`gte`/`lt`/`lte`) before scanning. `Query.between(low, high)` is the readable shortcut. `Query.explain()` returns the chosen plan. O(log n + k) for selective predicates, and the planner **drops the index when it would be slower than a scan** (>30% of the table) — 169× on 0.1% selectivity, 26× at 1%, ~1× past 20% on a 50K-row column ([numbers](#index-selectivity)).
 - **NumPy-accelerated filters** *(optional, v0.9.0)* — `select_where()` builds masks vectorially; `count_where()` (filtered count, no row materialization) reaches ~314M rows/s on numeric predicates (~166× the pure-Python path)
 - **Bitmask Queries** 🔥 *(v0.10.0)* — `select_bitmask()` evaluates `(value >> pos) & 1` predicates on integer columns with AND / OR / XOR combination semantics; routes around the comparison operators when the predicate is naturally bit-level (flags, parity, presence masks)
 - **Low memory footprint** — ~2.2 MB / 100K rows vs. 2.9 MB for SQLite, 11 MB for pandas, 22 MB for a plain `dict` ([benchmarks](#benchmarks))
@@ -493,6 +493,38 @@ Plain numeric columns export a true zero-copy view; encoded columns
 (dictionary/delta) transparently fall back to a materialized copy.
 
 ## Benchmarks
+
+### Index selectivity
+
+A `RangeIndex` is not a win at every selectivity. Serving k rows from an index
+costs k random row decodes; a scan decodes sequentially. Since v0.18.2 the
+planner **rejects the index when it would touch more than 30% of the table**
+and scans instead, so you never pay for an index you did not benefit from.
+
+50,000 rows, one `f32` column, median of 9 runs, Python 3.11 (x86-64):
+
+| rows matched | share | full scan | with `RangeIndex` | speedup |
+|---:|---:|---:|---:|---:|
+| 30 | 0.1% | 24.7 ms | 0.15 ms | **169×** |
+| 505 | 1% | 25.7 ms | 0.97 ms | 26× |
+| 2,505 | 5% | 25.4 ms | 4.6 ms | 5.5× |
+| 10,005 | 20% | 27.3 ms | 19.3 ms | 1.4× |
+| 20,005 | 40% | 31.7 ms | 29.7 ms | 1.1× — index rejected |
+| 40,005 | 80% | 37.8 ms | 35.7 ms | 1.1× — index rejected |
+
+Rows 0.1%–20% are the index path; the last two are the scan the guard falls
+back to, which is why they match scan speed instead of the 0.9×/0.4× they
+were before the guard existed. `Query.explain()` tells you which plan was
+chosen, and says why when an index was rejected:
+
+```console
+>>> Query(db).filter(age={"gte": 25, "lt": 35}).explain()
+'RangeIndex[age [25, 35)]'
+>>> Query(db).filter(age={"lte": 30}).explain()
+"Scan(filter=['age']) [index rejected: 62/100 rows]"
+```
+
+### Throughput and memory
 
 SnapDB's headline strength is memory efficiency — the columnar store is the
 lightest engine in this comparison while staying fully analytical:

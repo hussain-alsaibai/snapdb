@@ -23,6 +23,7 @@ Design notes:
 """
 from __future__ import annotations
 
+import bisect
 import operator
 from dataclasses import dataclass
 from itertools import islice
@@ -30,6 +31,10 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from .core import SnapDB
 
+
+# Above this share of the table an index plan is slower than a scan
+# (measured crossover ~40% on a 50K-row row-store; see _estimate_rows).
+_INDEX_SCAN_RATIO = 0.30
 
 _OPS = {
     "eq": operator.eq, "ne": operator.ne,
@@ -119,6 +124,46 @@ class _IndexPlan:
     high: Any = None
     inc_low: bool = True
     inc_high: bool = True
+    # Estimated rows the plan will touch (see ``_estimate_rows``). ``execute()``
+    # compares this against the table size and only takes the index when it is
+    # cheaper than a scan; ``None`` means "cannot estimate, trust the plan".
+    est_rows: Optional[int] = None
+
+
+def _estimate_rows(range_idx, mode: str, low: Any = None, high: Any = None,
+                   include_low: bool = True, include_high: bool = True) -> Optional[int]:
+    """How many rows a range plan would touch, from the index alone.
+
+    Two bisects over the sorted ``RangeIndex`` - O(log n) and allocation
+    free, so asking is safe on every ``execute()``. Returns ``None`` if the
+    index does not expose the shape we expect, in which case the caller
+    keeps the historical behaviour (always use the index).
+
+    This exists because the index is **not** a win at every selectivity.
+    Serving k rows from an index costs k random decodes through ``db.get``;
+    a scan decodes sequentially. Past roughly 30-40% of the table the index
+    is the slower path (measured: 0.9x at 40%, 0.4x at 80% on a 50K-row f32
+    column).
+    """
+    items = getattr(range_idx, "_items", None)
+    if items is None:
+        return None
+    start, end = 0, len(items)
+    try:
+        if low is not None:
+            start = bisect.bisect_left(items, (low, -1))
+            if not include_low:
+                start = bisect.bisect_right(items, (low, float("inf")))
+        if high is not None:
+            if include_high:
+                end = bisect.bisect_right(items, (high, float("inf")))
+            else:
+                end = bisect.bisect_left(items, (high, -1))
+    except TypeError:
+        # Mixed or non-orderable column values: let the index path handle it
+        # and fail the same way a lookup would, rather than guessing here.
+        return None
+    return max(0, end - start)
 
 
 def _split_conditions(conditions: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
@@ -187,6 +232,11 @@ def _plan_range(db: SnapDB, rng: Dict[str, Dict[str, Any]]) -> Optional[_IndexPl
             return _IndexPlan(
                 column=col, op="between", mode="between",
                 low=low, high=high, inc_low=inc_low, inc_high=inc_high,
+                est_rows=_estimate_rows(
+                    range_indexes[col], "between",
+                    low=low, high=high,
+                    include_low=inc_low, include_high=inc_high,
+                ),
             )
         # Emit the original op (gt vs gte / lt vs lte) so explain() and
         # log output preserve what the user actually wrote.
@@ -196,6 +246,10 @@ def _plan_range(db: SnapDB, rng: Dict[str, Dict[str, Any]]) -> Optional[_IndexPl
                     return _IndexPlan(
                         column=col, op=op_name, mode="range",
                         side="low", bound=val, include=op_name == "gte",
+                        est_rows=_estimate_rows(
+                            range_indexes[col], "range",
+                            low=val, include_low=op_name == "gte",
+                        ),
                     )
         if has_high:
             for op_name, val in spec.items():
@@ -203,6 +257,10 @@ def _plan_range(db: SnapDB, rng: Dict[str, Dict[str, Any]]) -> Optional[_IndexPl
                     return _IndexPlan(
                         column=col, op=op_name, mode="range",
                         side="high", bound=val, include=op_name == "lte",
+                        est_rows=_estimate_rows(
+                            range_indexes[col], "range",
+                            high=val, include_high=op_name == "lte",
+                        ),
                     )
     return None
 
@@ -336,6 +394,16 @@ class Query:
         candidate_indices: Optional[List[int]] = None
         if self.where_conditions:
             plan, _ = _plan_query(self.db, self.where_conditions)
+            # A range plan is not a win at every selectivity: k random
+            # decodes through db.get can cost more than one sequential
+            # scan. Drop the plan when it would touch more than
+            # ``_INDEX_SCAN_RATIO`` of the table; the scan then runs with the
+            # same predicate and returns the same rows, just cheaper.
+            # Equality plans are unaffected.
+            if plan is not None and plan.est_rows is not None:
+                total = len(self.db)
+                if total and plan.est_rows > total * _INDEX_SCAN_RATIO:
+                    plan = None
             if plan is not None:
                 if plan.mode == "hash":
                     idx = self.db._indexes.get(plan.column)  # type: ignore[union-attr]
@@ -503,6 +571,13 @@ class Query:
         if not self.where_conditions:
             return "Scan(full)"
         plan, _ = _plan_query(self.db, self.where_conditions)
+        if plan is not None and plan.est_rows is not None:
+            total = len(self.db)
+            if total and plan.est_rows > total * _INDEX_SCAN_RATIO:
+                return (
+                    f"Scan(filter={list(self.where_conditions.keys())}) "
+                    f"[index rejected: {plan.est_rows}/{total} rows]"
+                )
         if plan is None:
             return f"Scan(filter={list(self.where_conditions.keys())})"
         if plan.mode == "hash":

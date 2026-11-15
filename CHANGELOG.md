@@ -34,6 +34,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **An index plan is now only used when it is the cheaper plan.** `RangeIndex`
+  was used for every range predicate that had one, regardless of how many rows
+  the range covered. Serving k rows from an index costs k random decodes
+  through `db.get`, while a scan decodes sequentially, so past a few tens of
+  percent of the table the index was **slower than the scan it replaced**.
+  Measured on a 50K-row `f32` column (median of 9 runs):
+
+  | rows matched | scan | index | index speedup |
+  |---|---|---|---|
+  | 30 (0.1%) | 24.7 ms | 0.15 ms | **169×** |
+  | 505 (1%) | 25.7 ms | 0.97 ms | 26× |
+  | 2,505 (5%) | 25.4 ms | 4.6 ms | 5.5× |
+  | 10,005 (20%) | 27.3 ms | 19.3 ms | 1.4× |
+  | 20,005 (40%) | 31.7 ms | 29.7 ms | 1.1× |
+  | 40,005 (80%) | 37.8 ms | 35.7 ms | 1.1× |
+
+  (The last two rows are post-fix: the guard hands those queries back to the
+  scan, which is why they now match scan speed. Before the fix they were
+  **0.9× and 0.4×** — actively slower with the index in place.)
+
+  `Query.execute()` now estimates the rows a range plan would touch with two
+  bisects and drops the plan above `_INDEX_SCAN_RATIO` (0.30) of the table.
+  Equality plans are unchanged. Results are identical either way — the guard
+  changes how rows are found, never which.
+
+### Changed
+
+- `Query.explain()` reports the plan `execute()` will actually use, and names
+  the reason when an available index was rejected:
+  `Scan(filter=['age']) [index rejected: 62/100 rows]`. Previously it
+  advertised `RangeIndex[...]` for a query that fell back to a scan.
+
+### Docs
+
+- The 0.18.0 "31.5× speedup on a 50K-row narrow range" claim could not be
+  reproduced. Re-measuring the stated shape (50K rows, ~500 matches) gives
+  **26×**, and the number swings from 5.5× to 169× depending on selectivity
+  and on whether the comparison includes query-construction overhead. The
+  README and the 0.18.0 entry now carry the table above instead of a single
+  scalar.
+
 ## [0.18.0] - 2026-10-18
 
 ### Added
