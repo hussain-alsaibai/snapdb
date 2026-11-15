@@ -20,7 +20,6 @@ package whose metadata lies about what it contains.
 
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 import unittest
