@@ -32,9 +32,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Repo-metadata checks now `skipTest` instead of `FileNotFoundError` when the
   file is absent from the sdist — the checkout still enforces them.
 
-## [Unreleased]
+## [0.18.2] - 2026-11-16
 
 ### Fixed
+
+- **The selectivity guard only applied to `execute()`. `count()` and every
+  aggregation bypassed it.** v0.18.2 (this release) added the guard, wired it
+  into `execute()`, and left three other paths calling the raw planner. Both
+  directions were wrong:
+
+  | query | `execute()` | `count()` / `sum()` / `avg()` / `min()` / `max()` |
+  |---|---|---|
+  | range matching **1%** of rows | 1.1 ms (index) | **37 ms** (full scan) |
+  | range matching **62%** of rows | scan | scan **plus** a 162K-element candidate set |
+
+  A selective `count()` was ~34× slower than `len(execute())` on the same
+  predicate, and it scanned a table whose index already named the matching
+  rows. A wide aggregation scanned *and* materialised the plan `explain()` had
+  just reported as rejected - on a 200K-row table, `_execute_plan` built a
+  162K-element set in 706 ms, paid again by each of four aggregations.
+
+  The guard now lives in a single helper, `_plan_or_scan()`, used by
+  `execute()`, `count()` and `_iter_matching_values()`. A regression test
+  asserts that exactly two call sites may reach the raw `_plan_query()`, so a
+  future consumer cannot silently skip the guard.
+
+- **`min()` and `max()` raised `TypeError` when a query matched exactly one
+  row.** `min(first, *rest)` lowers to `min(first)` when `rest` is empty, and
+  `min` of a number is not iterable. A one-row result is the common case for a
+  selective index query, so this broke the queries the index made fast. The
+  first value is now chained back into the iterator instead of splatted.
+
+### Changed
+
+- `Query.count()` walks the index candidate set instead of the whole table.
+  Correctness is unchanged; membership testing against a set no longer forces
+  a decode of every row.
+
+
+### Performance
 
 - **An index plan is now only used when it is the cheaper plan.** `RangeIndex`
   was used for every range predicate that had one, regardless of how many rows
@@ -60,8 +96,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bisects and drops the plan above `_INDEX_SCAN_RATIO` (0.30) of the table.
   Equality plans are unchanged. Results are identical either way — the guard
   changes how rows are found, never which.
-
-### Changed
 
 - `Query.explain()` reports the plan `execute()` will actually use, and names
   the reason when an available index was rejected:

@@ -524,6 +524,23 @@ chosen, and says why when an index was rejected:
 "Scan(filter=['age']) [index rejected: 62/100 rows]"
 ```
 
+#### The guard covers every reduction, not just `execute()`
+
+`count()`, `sum()`, `avg()`, `min()`, `max()` and `count_distinct()` reach the
+index through the same guard. Before v0.18.2 they did not, and the difference
+was not small:
+
+| query (50K rows) | `execute()` | `count()` before | `count()` now |
+|---|---:|---:|---:|
+| range matching 1% | 0.97 ms | **37.1 ms** | 0.95 ms |
+| range matching 62% | 30.1 ms | scan **+ 31K-element set** | 22.6 ms |
+
+A selective `count()` was ~38× slower than `len(execute())` on the same
+predicate, because it ignored the index that named the matching rows. A wide
+one scanned *and* materialised the plan `explain()` had just called rejected.
+Both now agree with `execute()`. If you read one number from this table, read
+the middle column: it is what "the index exists but nothing uses it" costs.
+
 ### Throughput and memory
 
 SnapDB's headline strength is memory efficiency — the columnar store is the

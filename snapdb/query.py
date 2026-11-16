@@ -24,6 +24,7 @@ Design notes:
 from __future__ import annotations
 
 import bisect
+import itertools
 import operator
 from dataclasses import dataclass
 from itertools import islice
@@ -164,6 +165,33 @@ def _estimate_rows(range_idx, mode: str, low: Any = None, high: Any = None,
         # and fail the same way a lookup would, rather than guessing here.
         return None
     return max(0, end - start)
+
+
+def _rejected_by_guard(db: SnapDB, plan: Optional[_IndexPlan]) -> bool:
+    """True when the plan should be dropped because a scan is cheaper.
+
+    Single source of truth for the v0.18.2 selectivity guard. It must be
+    consulted by **every** path that consumes an index plan - ``execute()``,
+    ``count()`` and the aggregations - otherwise one path honours the guard
+    and the others still pay for an index the engine already decided was the
+    worse plan. ``explain()`` reads it too, so the report and the behaviour
+    cannot disagree.
+    """
+    if plan is None or plan.est_rows is None:
+        return False
+    total = len(db)
+    return bool(total) and plan.est_rows > total * _INDEX_SCAN_RATIO
+
+
+def _plan_or_scan(db: SnapDB, conditions: Dict[str, Any]) -> Optional[_IndexPlan]:
+    """Plan a query, returning ``None`` when the guard rejects the plan.
+
+    Use this instead of calling ``_plan_query`` and decoding ``plan.mode``
+    by hand - that is how ``count()`` and the aggregations ended up
+    bypassing the guard.
+    """
+    plan, _ = _plan_query(db, conditions)
+    return None if _rejected_by_guard(db, plan) else plan
 
 
 def _split_conditions(conditions: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
@@ -393,17 +421,9 @@ class Query:
         plan: Optional[_IndexPlan] = None
         candidate_indices: Optional[List[int]] = None
         if self.where_conditions:
-            plan, _ = _plan_query(self.db, self.where_conditions)
-            # A range plan is not a win at every selectivity: k random
-            # decodes through db.get can cost more than one sequential
-            # scan. Drop the plan when it would touch more than
-            # ``_INDEX_SCAN_RATIO`` of the table; the scan then runs with the
-            # same predicate and returns the same rows, just cheaper.
-            # Equality plans are unaffected.
-            if plan is not None and plan.est_rows is not None:
-                total = len(self.db)
-                if total and plan.est_rows > total * _INDEX_SCAN_RATIO:
-                    plan = None
+            # v0.18.2 - the selectivity guard lives in ``_plan_or_scan`` so
+            # that execute(), count() and the aggregations cannot diverge.
+            plan = _plan_or_scan(self.db, self.where_conditions)
             if plan is not None:
                 if plan.mode == "hash":
                     idx = self.db._indexes.get(plan.column)  # type: ignore[union-attr]
@@ -477,15 +497,15 @@ class Query:
         if not self.where:
             return len(self.db)
 
-        plan, _ = _plan_query(self.db, self.where_conditions or {})
+        plan = _plan_or_scan(self.db, self.where_conditions or {})
         if plan is not None:
             candidates = _execute_plan(self.db, plan)
             if not candidates:
                 return 0
-            return sum(
-                1 for idx, row in self.db
-                if idx in candidates and self.where(row)
-            )
+            # Iterate the candidate set, not the table: membership in a set
+            # is O(1) here, but the scan decodes every row to test it.
+            return sum(1 for idx in candidates if (row := self.db.get(idx)) is not None
+                       and (self.where is None or self.where(row)))
         return sum(1 for _, row in self.db if self.where(row))
 
     # Aggregations (v0.16.1) - now index-aware (v0.18.0)
@@ -495,17 +515,18 @@ class Query:
         plan = None
         candidates: Optional[Set[int]] = None
         if self.where_conditions:
-            plan, _ = _plan_query(self.db, self.where_conditions)
+            plan = _plan_or_scan(self.db, self.where_conditions)
             if plan is not None:
                 candidates = _execute_plan(self.db, plan)
                 if not candidates:
                     return
 
         if candidates is not None:
-            for idx, row in self.db:
-                if self.where is not None and not self.where(row):
+            for idx in candidates:
+                row = self.db.get(idx)
+                if row is None:
                     continue
-                if idx not in candidates:
+                if self.where is not None and not self.where(row):
                     continue
                 v = row.get(column)
                 if v is not None:
@@ -529,20 +550,28 @@ class Query:
         return total
 
     def min(self, column: str, default: Any = None) -> Any:
+        """Smallest non-None ``column`` value among matching rows.
+
+        ``min(first, *rest)`` crashes when ``rest`` is empty - it lowers to
+        ``min(first)``, and ``min`` of an int is not iterable. A one-row
+        result is the *common* case for a selective index query, so this
+        raised ``TypeError`` on exactly the queries v0.18 made fast.
+        """
         it = self._iter_matching_values(column)
         try:
             first = next(it)
         except StopIteration:
             return default
-        return min(first, *(v for v in it))
+        return min(itertools.chain((first,), it))
 
     def max(self, column: str, default: Any = None) -> Any:
+        """Largest non-None ``column`` value among matching rows."""
         it = self._iter_matching_values(column)
         try:
             first = next(it)
         except StopIteration:
             return default
-        return max(first, *(v for v in it))
+        return max(itertools.chain((first,), it))
 
     def avg(self, column: str, default: Any = None) -> Optional[float]:
         total = 0
@@ -570,16 +599,13 @@ class Query:
         """
         if not self.where_conditions:
             return "Scan(full)"
-        plan, _ = _plan_query(self.db, self.where_conditions)
-        if plan is not None and plan.est_rows is not None:
-            total = len(self.db)
-            if total and plan.est_rows > total * _INDEX_SCAN_RATIO:
-                return (
-                    f"Scan(filter={list(self.where_conditions.keys())}) "
-                    f"[index rejected: {plan.est_rows}/{total} rows]"
-                )
+        on_filter = f"Scan(filter={list(self.where_conditions.keys())})"
+        raw, _ = _plan_query(self.db, self.where_conditions)
+        plan = None if _rejected_by_guard(self.db, raw) else raw
         if plan is None:
-            return f"Scan(filter={list(self.where_conditions.keys())})"
+            if raw is not None and raw.est_rows is not None:
+                return f"{on_filter} [index rejected: {raw.est_rows}/{len(self.db)} rows]"
+            return on_filter
         if plan.mode == "hash":
             return f"HashIndex[{plan.column} = {plan.value!r}]"
         if plan.mode == "between":
