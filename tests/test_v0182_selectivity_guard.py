@@ -14,7 +14,9 @@ import unittest
 from pathlib import Path
 
 from snapdb.core import SnapDB, Schema, ColumnDef
-import snapdb.query as qmod
+import importlib
+
+qmod = importlib.import_module("snapdb.query")
 from snapdb.query import query, _plan_query
 
 

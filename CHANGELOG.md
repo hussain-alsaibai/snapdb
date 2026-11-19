@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.3] - 2026-11-19
+
+### Fixed
+
+- **`from snapdb import query` gave you the module, not the function.** The
+  README has documented this import since v0.18.0 and it had never worked.
+  `snapdb/query.py` defines a function also called `query()`, and
+  `__init__.py` did not import it. Python's `from package import name` falls
+  back to loading the submodule when the attribute is absent, so the name
+  bound to the **module** and every documented call raised:
+
+  ```
+  TypeError: 'module' object is not callable
+  ```
+
+  Nothing raised at import time, so the failure surfaced only in user code,
+  where it reads as the user's mistake. It survived four releases because
+  every test imported from the defining module (`from snapdb.query import
+  query`), which has always worked. `__init__.py` now re-exports both `query`
+  and `Query`, and six regression tests assert the package-level name is
+  callable, is in `__all__`, and that the README's own example runs end to
+  end. Five of the six fail against 0.18.2.
+
+  Internal call sites that relied on the accidental module binding used
+  `import snapdb.query as qmod`; two test files did, and now use
+  `importlib.import_module("snapdb.query")` so the distinction is explicit.
+
+### Added
+
+- `examples/agent_memory.py` — the README's "SnapDB for AI Agent Memory"
+  argument as a runnable script: 20k-record audit trail, named snapshot,
+  point reads, indexed vs. scanned range query with `explain()`, and a
+  restore that checks the row count. Asserts the index changes the plan and
+  not the result.
+- CI runs the example's assertions through the test suite
+  (`tests/test_package_query_export.py`), so it cannot rot the way a README
+  snippet does.
+
 ## [0.18.1] - 2026-11-11
 
 ### Fixed

@@ -30,7 +30,7 @@ Vector search (v0.17.0+):
     [('alice', 0.9998...)]
 """
 
-__version__ = "0.18.2"
+__version__ = "0.18.3"
 __author__ = "OpenClaw (hussain-alsaibai)"
 __license__ = "MIT"
 
@@ -39,6 +39,7 @@ from .core import SnapDB, Schema, ColumnDef, CDCLog
 from .columnar import ColumnarTable, Column
 from .metrics import Metrics
 from .profiler import QueryProfiler
+from .query import Query, query
 from .vector import (
     VectorIndex,
     cosine_similarity,
@@ -55,6 +56,8 @@ __all__ = [
     "Metrics",
     "CDCLog",
     "QueryProfiler",
+    "Query",
+    "query",
     "VectorIndex",
     "cosine_similarity",
     "euclidean_distance",

@@ -50,6 +50,29 @@ In 2026, autonomous agents are the primary users of embedded databases. SnapDB i
 
 SnapDB is purpose-built for the **durable state** and **audit trail** needs of autonomous AI agents. Here's how it maps to real agent patterns:
 
+> **Run it before you read it:** [`examples/agent_memory.py`](examples/agent_memory.py)
+is the whole argument below, executed on a 20,000-step audit trail. It prints
+the cost of each operation on your machine and asserts that the index changed
+the *speed* and not the *answer*:
+>
+> ```
+> $ python examples/agent_memory.py
+> append         20,000 rows      168.4 ms      8.4 us/row
+> snapshot       'before-refactor'        3.2 ms   20,000 rows recorded
+> point read     10,000 gets       46.6 ms     4.66 us/get
+> plain scan    "Scan(filter=['step'])"
+>               execute     32.7 ms   count     26.7 ms   (400 rows)
+> with index    'RangeIndex[step [19600, 20000]]'
+>               execute      1.2 ms   count      1.4 ms   (400 rows)
+> speedup       execute  27.9x   count  18.6x
+> same answer   400 rows both ways
+> ok — every assertion held
+> ```
+>
+> Those are one container's numbers, not a benchmark against SQLite. The
+point is that `explain()` tells you which plan you are about to get, and the
+same predicate costs 1.2 ms or 32.7 ms depending on that answer.
+
 ### Pattern 1: State Snapshotting
 
 Agents maintain complex in-memory state (conversation history, tool results, pending tasks). SnapDB's named snapshots let you atomically save and restore entire agent state in milliseconds — no serialization overhead.
