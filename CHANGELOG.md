@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.4] - 2026-11-23
+
+### Fixed
+
+- **A document store whose first record lacked a field dropped that field
+  forever.** `DocumentStore._coerce` coerced every document against the schema
+  inferred from record one, so `insert({"text": ..., "ts": 3})` against a store
+  whose first document was `{"text": ...}` wrote the text and silently
+  discarded `ts` — no error, no warning. The field map now grows when a
+  document names a new key, and **`SnapDB.replace_schema(new_schema)`** (new
+  public API) performs the on-disk widening, because the row layout is
+  positional and a slab decodes with the schema object it was built with.
+  A widened schema survives close/reopen and keeps every earlier row.
+
+- **An absent field came back as `0` / `""` / `False`.** Combined with the
+  above, pre-widening rows were re-encoded with the type default, so a
+  `ts` column claimed every pre-existing record happened at the unix epoch.
+  Nullable columns now store an empty slot that decodes to a *missing key*, so
+  a caller can tell "no value recorded" from "the value was zero". Absence
+  also sorts **last** in both directions rather than first, so
+  `query(sort="ts", limit=10)` never spends its first slot on an empty record.
+
+- **`query(sort=...)` raised `TypeError` on a string field with any absent
+  value, and silently mis-ordered a float field.** The sort key mixed the
+  absent `0` with real values: strings raised
+  `'<' not supported between 'str' and 'int'`, floats interleaved with `0.0`
+  and produced a plausible-looking wrong order. The sort key is now a total
+  order (`_sort_key`) and `desc` reverses only the value band.
+
+- **`sort` was applied after `limit`/`offset`.** `query(sort="ts", limit=2)`
+  limited the *unsorted* scan, so the two rows it returned were the first two
+  on disk, not the two smallest. Sorting now precedes slicing.
+
+- **`search(term, limit=0)` returned 1 hit; a negative limit meant "no
+  limit".** `limit <= 0` now returns nothing, matching `query()`.
+
+### Changed
+
+- `replace_schema()` re-packs live rows densely: ids after a deleted row shift
+  down. Read the docstring before holding a row id across a schema change.
+
 ## [0.18.3] - 2026-11-19
 
 ### Fixed

@@ -17,6 +17,48 @@ from typing import Any, Dict, Iterator, List, Optional
 from .core import SnapDB, Schema, ColumnDef
 
 
+def _infer_dtype(val: Any) -> Optional[str]:
+    """Map a Python value to a SnapDB column type, or None if width-dependent.
+
+    ``None`` means "this needs ``max_field_len`` to size the column" — strings
+    and complex values — not "untypeable".
+    """
+    if isinstance(val, bool):
+        return "bool"
+    if isinstance(val, int):
+        return "i32"
+    if isinstance(val, float):
+        return "f64"
+    return None
+
+
+def _sort_key(value: Any) -> Any:
+    """Order a heterogeneous field without raising, and without lying.
+
+    ``rows.sort(key=lambda x: x[1].get(sort, 0))`` mixes an absent field
+    (``0``) with real values. When the real values are strings, Python 3
+    raises ``TypeError: '<' not supported between 'str' and 'int'``; when
+    they are floats, ``0`` silently sorts as an ordinary value, so a missing
+    timestamps column interleaves with the present ones and the order is
+    wrong but plausible. Neither is acceptable in a store whose selling point
+    is a durable agent audit trail.
+
+    The key puts every value into one total order: things that sort are
+    ordered among themselves, and ``None`` (absent / unorderable) always
+    sorts last, so a caller reading ``sort="ts", limit=10`` never gets an
+    empty-valued row before a real one.
+    """
+    if value is None:
+        return (1, 0, "")
+    if isinstance(value, bool):
+        return (0, 0, int(value))
+    if isinstance(value, (int, float)):
+        return (0, 0, value)
+    if isinstance(value, str):
+        return (0, 1, value)
+    return (0, 2, repr(value))
+
+
 class DocumentStore:
     """
     JSON document store backed by SnapDB binary storage.
@@ -30,11 +72,65 @@ class DocumentStore:
         self.max_field_len = max_field_len
         self._db: Optional[SnapDB] = None
         self._field_types: Dict[str, str] = {}
+        # Per-call record of which doc keys were absent (see _coerce).
+        self._unset_seen: Optional[frozenset] = None
+        self._unset_token: Optional[int] = None
 
         if os.path.exists(path) and os.path.getsize(path) > 0:
             self._load()
         else:
             self._db = None
+
+    def _rebuild_for_schema_growth(self) -> None:
+        """Widen the on-disk schema so a newly-seen document field persists.
+
+        The schema used to be fixed by the first document: a later
+        ``insert({"text": ..., "ts": 3})`` silently dropped ``ts``, and the
+        only field that ever existed was the one the very first record named.
+
+        The rewrite itself is ``SnapDB.replace_schema`` — the row format is
+        positional, so this cannot be an in-place assignment. Rows written
+        before the column existed are re-encoded with the null placeholder, so
+        ``query(sort="ts")`` does not present a legacy record as ``ts == 0``;
+        the caller's insert then runs normally against the widened schema.
+        """
+        db = self._db
+        if db is None:
+            return
+        db.replace_schema(Schema(self._schema_columns()))
+
+    def _unset_fields(self, token: Optional[int]) -> frozenset:
+        """Keys the current ``_coerce`` call must leave NULL.
+
+        ``_coerce`` receives only a dict, so the key set of the caller's
+        original document is stashed by identity right before the call. If the
+        token does not match (a bare ``_coerce`` call, e.g. from an update
+        path that already has a full row), nothing is treated as absent and
+        every field keeps the "fill with the type default" behaviour.
+        """
+        if token is None or token != self._unset_token:
+            return frozenset()
+        return self._unset_seen or frozenset()
+
+    def _coerce_document(self, doc: Dict[str, Any]) -> Dict[str, Any]:
+        """Coerce ``doc``, recording which keys it did not mention."""
+        if self._db is not None:
+            self._unset_seen = frozenset(self._field_types) - frozenset(doc)
+            self._unset_token = id(doc)
+        try:
+            return self._coerce(doc)
+        finally:
+            self._unset_token = None
+            self._unset_seen = None
+
+    def _dtype_for(self, val: Any) -> str:
+        """Column type for one value, including the width-dependent types."""
+        inferred = _infer_dtype(val)
+        if inferred is not None:
+            return inferred
+        if isinstance(val, (str, bytes)):
+            return f"bytes:{self.max_field_len}"
+        return f"bytes:{self.max_field_len * 2}"
 
     def _infer_schema(self, doc: Dict[str, Any]) -> Schema:
         """Infer fixed-width schema from a JSON document."""
@@ -54,14 +150,48 @@ class DocumentStore:
                 dtype = f"bytes:{self.max_field_len * 2}"
             columns.append(ColumnDef(key, dtype))
             self._field_types[key] = dtype
-        return Schema(columns)
+        return Schema(self._schema_columns())
+
+    def _schema_columns(self) -> List[ColumnDef]:
+        # ``not_null=False`` is what makes an absent field storable: the row
+        # format is fixed-width, and a caller who never wrote ``ts`` has no
+        # value to encode for it. Without this the widening rewrite and every
+        # subsequent insert into a sparse document both raise.
+        return [
+            ColumnDef(name, dtype, not_null=False)
+            for name, dtype in self._field_types.items()
+        ]
 
     def _coerce(self, doc: Dict[str, Any]) -> Dict[str, Any]:
-        """Coerce a document to match the fixed-width schema."""
+        """Coerce a document to match the fixed-width schema.
+
+        A key that is present in ``doc`` but absent from the schema is added
+        before coercion. Without this, the schema was fixed by the first
+        document forever: ``insert({"text": ..., "ts": 3})`` against a store
+        whose first document had only ``text`` silently dropped ``ts``.
+        """
+        missing = [k for k in doc if k not in self._field_types]
+        if missing:
+            for key in missing:
+                self._field_types[key] = self._dtype_for(doc[key])
+            if self._db is not None:
+                self._rebuild_for_schema_growth()
+
         result = {}
+        unset = self._unset_fields(id(doc))
         for key, dtype in self._field_types.items():
             val = doc.get(key)
-            if val is None:
+            if key in unset:
+                # The caller did not mention this field: keep it NULL rather
+                # than writing the type default. Otherwise a record inserted
+                # before a column existed comes back indistinguishable from a
+                # record that explicitly said 0 / "" / False, and a sort or a
+                # [:5] tail scan cannot tell an absent value from a real one.
+                # Absent: keep it NULL in storage and drop it on the way out
+                # (see _decode), so it is neither "" / 0 / False nor a
+                # caller-visible key the caller never wrote.
+                result[key] = b"" if dtype.startswith("bytes") else None
+            elif val is None:
                 if dtype == "bool":
                     result[key] = False
                 elif dtype in ("i8", "i16", "i32", "i64"):
@@ -71,7 +201,7 @@ class DocumentStore:
                 elif dtype.startswith("bytes"):
                     result[key] = b""
                 else:
-                    result[key] = b""
+                    result[key] = 0
             elif dtype.startswith("bytes"):
                 if isinstance(val, bytes):
                     result[key] = val
@@ -85,9 +215,22 @@ class DocumentStore:
         return result
 
     def _decode(self, row: Dict[str, Any]) -> Dict[str, Any]:
-        """Decode a row back to JSON-friendly types."""
+        """Decode a row back to JSON-friendly types.
+
+        Keys the writer never supplied are omitted, not returned as "" / 0 /
+        False. The placeholders exist so the fixed-width row can be encoded;
+        handing them back would make an absent field indistinguishable from a
+        value the caller actually wrote, which is the difference between "this
+        agent step recorded no failure reason" and "it recorded an empty one".
+        """
         result = {}
         for key, val in row.items():
+            if val is None or (isinstance(val, bytes) and val == b"") or val == "":
+                # Absent — see the docstring. A stored ``b""`` is the
+                # fixed-width placeholder for a field the caller never
+                # supplied; '' / 0 / False the caller wrote are returned as
+                # written, because those are JSON-encoded, not empty.
+                continue
             if isinstance(val, bytes):
                 # Try decode as JSON first, then string
                 try:
@@ -125,7 +268,7 @@ class DocumentStore:
             schema = self._infer_schema(doc)
             self._db = SnapDB(self.path, schema)
 
-        row = self._coerce(doc)
+        row = self._coerce_document(doc)
         return self._db.insert(row)
 
     def get(self, idx: int) -> Optional[Dict[str, Any]]:
@@ -141,7 +284,7 @@ class DocumentStore:
         """Update a document."""
         if self._db is None:
             raise RuntimeError("No documents stored yet")
-        row = self._coerce(doc)
+        row = self._coerce_document(doc)
         self._db.update(idx, row)
 
     def delete(self, idx: int) -> None:
@@ -182,9 +325,19 @@ class DocumentStore:
         else:
             rows = [(idx, self._decode(row)) for idx, row in self._db]
 
-        # Sort
+        # Sort. The key is total (see _sort_key): a mixed or absent field
+        # used to raise TypeError or interleave silently-wrong rows.
+        #
+        # ``desc`` is applied only to the value band, never to the
+        # absent/unorderable band, so an empty field cannot be promoted to the
+        # top of a descending sort. Empty rows stay last in both directions.
         if sort:
-            rows.sort(key=lambda x: x[1].get(sort, 0), reverse=desc)
+            rows.sort(key=lambda x: _sort_key(x[1].get(sort)))
+            if desc:
+                present = [r for r in rows if _sort_key(r[1].get(sort))[0] == 0]
+                absent = [r for r in rows if _sort_key(r[1].get(sort))[0] != 0]
+                present.reverse()
+                rows = present + absent
 
         # Slice
         start = offset
@@ -279,7 +432,7 @@ class DocumentStore:
         a full-text engine. Pass ``fields`` to restrict which columns are
         searched (defaults to all string columns).
         """
-        if self._db is None:
+        if self._db is None or limit is None or limit <= 0:
             return []
         term_l = term.lower()
         candidates = fields if fields else list(self._field_types.keys())

@@ -94,6 +94,23 @@ class ColumnDef:
             object.__setattr__(self, "not_null", True)
 
 
+def _decode_cell(col: "ColumnDef", val: Any) -> Any:
+    """Decode one unpacked cell, mapping the empty slot to ``None``.
+
+    A nullable column stores its empty slot as zero bytes, which is what
+    ``decode_row`` must report as absent rather than as ``""`` / ``0`` /
+    ``False``. Non-nullable columns keep the historical behaviour exactly, so
+    existing callers see no change.
+    """
+    if col.dtype.startswith("bytes"):
+        if not col.not_null and not val.strip(b"\x00"):
+            return None
+        return val.rstrip(b"\x00").decode("utf-8", errors="replace")
+    if val == 0 and not col.not_null and not col.dtype == "bool":
+        return None
+    return val
+
+
 class Schema:
     """Table schema definition."""
 
@@ -116,6 +133,11 @@ class Schema:
         self._col_names_tuple = tuple(c.name for c in self.columns)
         self._bytes_positions = tuple(i for i, c in enumerate(self.columns)
                                       if c.dtype.startswith("bytes"))
+        # Columns that can hold NULL: the fast path in iter_unpack_rows skips
+        # the per-cell decode only when there is neither a bytes column nor a
+        # nullable one.
+        self._nullable_positions = tuple(i for i, c in enumerate(self.columns)
+                                        if not c.not_null)
         # Columns eligible for per-slab zone maps (min/max pruning): ordered,
         # comparable, fixed-width scalars. Bytes columns ARE lexically
         # comparable but their zone-map value would be the decoded str (not
@@ -181,7 +203,13 @@ class Schema:
             val = row[col.name]
             if val is None and col.not_null:
                 raise ValueError(f"Column {col.name!r} cannot be None")
-            if col.dtype == "bool":
+            if val is None:
+                # Nullable column with no value: the empty slot. ``struct``
+                # cannot pack ``None`` for any of these types, and the
+                # zero-filled slot is exactly the "never written" state that
+                # decode_row reports as ``None`` for a nullable column.
+                values.append(b"" if col.dtype.startswith("bytes") else 0)
+            elif col.dtype == "bool":
                 values.append(bool(val))
             elif col.dtype.startswith("bytes"):
                 raw = val if isinstance(val, bytes) else str(val).encode("utf-8")
@@ -195,10 +223,7 @@ class Schema:
         unpacked = struct.unpack(self._struct_fmt, buf)
         row: Dict[str, Any] = {}
         for col, val in zip(self.columns, unpacked):
-            if col.dtype.startswith("bytes"):
-                row[col.name] = val.rstrip(b"\x00").decode("utf-8", errors="replace")
-            else:
-                row[col.name] = val
+            row[col.name] = _decode_cell(col, val)
         return row
 
     def iter_unpack_rows(self, buf: bytes) -> Iterator[Dict[str, Any]]:
@@ -212,17 +237,52 @@ class Schema:
         go through decode_row instead.
         """
         names = self._col_names_tuple
-        bytes_positions = self._bytes_positions
-        if not bytes_positions:
+        columns = self.columns
+        nullable = self._nullable_positions
+        if not self._bytes_positions and not nullable:
             for unpacked in struct.iter_unpack(self._struct_fmt, buf):
                 yield dict(zip(names, unpacked))
             return
         for unpacked in struct.iter_unpack(self._struct_fmt, buf):
-            row: Dict[str, Any] = dict(zip(names, unpacked))
-            for pos in bytes_positions:
-                name = names[pos]
-                row[name] = row[name].rstrip(b"\x00").decode("utf-8", errors="replace")
+            row: Dict[str, Any] = {}
+            for pos, val in enumerate(unpacked):
+                col = columns[pos]
+                row[names[pos]] = _decode_cell(col, val)
             yield row
+
+
+def _fill_row_for_encode(row: Dict[str, Any], schema: "Schema") -> Dict[str, Any]:
+    """Fill columns absent from ``row`` with the null placeholder.
+
+    ``Schema.encode_row`` raises ``KeyError`` for a missing column, which is
+    right for a caller that forgot a required field but wrong for
+    ``replace_schema``: it is widening a table, and rows written before a
+    column existed legitimately have no value for it. Filling at encode time
+    keeps the strictness where it belongs (the public insert path) and gives
+    the rewrite a defined placeholder.
+
+    The placeholder MUST be ``None``, not the type default. Writing ``0`` for a
+    column added after the row was written makes the absent value
+    indistinguishable from a real ``0`` — a ``ts`` column would claim every
+    pre-existing agent step ran at the unix epoch, and a ``sort``/``limit``
+    read would treat them as the oldest records rather than as unknown.
+    ``Schema`` stores these as the empty slot, which readers see as absent.
+    """
+    filled: Dict[str, Any] = {}
+    for col in schema.columns:
+        if col.name in row:
+            filled[col.name] = row[col.name]
+        elif not col.not_null:
+            filled[col.name] = None
+        elif col.dtype == "bool":
+            filled[col.name] = False
+        elif col.dtype.startswith("f"):
+            filled[col.name] = 0.0
+        elif col.dtype.startswith("bytes"):
+            filled[col.name] = b""
+        else:
+            filled[col.name] = 0
+    return filled
 
 
 # ── Slab (Segment) ───────────────────────────────────────────────────────────
@@ -1399,6 +1459,106 @@ class SnapDB:
         self._mm[:_HEADER_SIZE] = struct.pack(
             _HEADER_FMT, _MAGIC, _VERSION, self.page_size,
             last_count, self._schema_offset)
+
+    def replace_schema(self, new_schema: Schema) -> int:
+        """Rewrite this file under ``new_schema``, keeping every live row.
+
+        The row layout is positional — ``offset = idx * row_width`` — and a
+        slab decodes with the schema object it was constructed with, so a
+        wider schema cannot simply be assigned to ``self.schema``. Rows would
+        then be read from the wrong offsets, and rows written before the new
+        column existed would come back as that column's type default rather
+        than as absent.
+
+        The file is rewritten in one pass: header + new schema + live rows
+        re-encoded at the new width. Live rows keep their relative order, but
+        ids are RE-PACKED: a hole left by a delete no longer occupies a slot,
+        so ids after the first hole shift down. Callers holding a row id across
+        a schema change must re-read it.
+
+        Returns the number of bytes the file grew by (or shrank by, negative).
+        Raises ``RuntimeError`` inside a transaction — the WAL holds rows in
+        the OLD shape and replaying it against the new one would corrupt data.
+        """
+        with self._lock:
+            if self.is_columnar():
+                raise RuntimeError(
+                    "replace_schema() is row-storage only; columnar tables store "
+                    "a list of columns and do not need a rewrite."
+                )
+            if self._in_tx:
+                raise RuntimeError(
+                    "Cannot change the schema inside a transaction: the journal "
+                    "holds rows in the previous shape."
+                )
+            if self._closed:
+                raise RuntimeError("Cannot change the schema of a closed database.")
+
+            # (idx, row) for every live row, holes skipped.
+            live_rows = [(idx, row) for idx, row in self]
+            index_columns = list(self._indexes._indexes.keys()) if self._indexes else []
+            range_index_columns = list(self._range_indexes.keys())
+            old_size = self.path.stat().st_size if self.path.exists() else 0
+
+            schema_json = json.dumps(new_schema.to_json()).encode("utf-8")
+            schema_offset = _HEADER_SIZE + len(schema_json)
+            rows_per_slab = max(1, self.page_size // new_schema.row_width)
+            bitmap_size = rows_per_slab
+            slab_count = max(1, (len(live_rows) + rows_per_slab - 1) // rows_per_slab)
+            last_count = len(live_rows) - (slab_count - 1) * rows_per_slab
+            if len(live_rows) == 0:
+                last_count = 0
+            elif last_count == 0:
+                last_count = rows_per_slab
+
+            tmp = self.path.with_suffix(self.path.suffix + ".schema")
+            # Rows are re-packed densely: a hole no longer occupies a slot,
+            # so ids after the first hole shift down (see the docstring).
+            ordered = [row for _, row in live_rows]
+
+            with open(tmp, "wb") as f:
+                f.write(struct.pack(_HEADER_FMT, _MAGIC, _VERSION, self.page_size,
+                                    last_count, schema_offset))
+                f.write(schema_json)
+                pos = 0
+                while pos < len(ordered):
+                    chunk = ordered[pos:pos + rows_per_slab]
+                    live = bytearray(bitmap_size)
+                    page = bytearray(self.page_size)
+                    for i, row in enumerate(chunk):
+                        live[i] = 1
+                        raw = new_schema.encode_row(_fill_row_for_encode(row, new_schema))
+                        start = i * new_schema.row_width
+                        if self._crypto_key is not None:
+                            absolute = (schema_offset
+                                        + (pos // rows_per_slab) * (bitmap_size + self.page_size)
+                                        + bitmap_size + start)
+                            raw = self._crypt_row(raw, absolute)
+                        page[start:start + len(raw)] = raw
+                    f.write(live)
+                    f.write(page)
+                    pos += len(chunk)
+                f.flush()
+                os.fsync(f.fileno())
+
+            # Drop the old mapping, swap the file in, re-open through _load so
+            # slabs get the new schema object.
+            self._close_mapping_only()
+            os.replace(tmp, self.path)
+            self._slabs = []
+            self._total_rows = 0
+            self._load()
+            self._indexes = MultiIndex() if MultiIndex is not None else None
+            for column in index_columns:
+                self.create_index(column)
+            self._range_indexes = {}
+            for column in range_index_columns:
+                self.create_range_index(column)
+            self._rebuild_unique_constraints()
+            if self._wal is not None:
+                self._wal.clear()
+            new_size = self.path.stat().st_size if self.path.exists() else 0
+            return new_size - old_size
 
     def flush(self) -> None:
         """Persist liveness bitmaps and flush the mmap to disk (row storage)."""

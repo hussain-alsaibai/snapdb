@@ -668,6 +668,19 @@ on Linux (3.9–3.13) and Windows, and the benchmark on every push and PR.
 
 ## Version History
 
+- **v0.18.4** — `DocumentStore` schema growth and honest absence:
+  - A store whose first document lacked a field used to drop that field from
+    every later insert, silently. The field map now grows, and the new
+    **`SnapDB.replace_schema(new_schema)`** rewrites the file at the new row
+    width (survives reopen; every earlier row is kept)
+  - Absent fields come back **missing**, not as `0` / `""` / `False`, because
+    the placeholders were indistinguishable from values a caller wrote
+  - `query(sort=...)` no longer raises `TypeError` on a string field with an
+    absent value and no longer mis-orders floats; absence sorts last in both
+    directions, and `sort` is applied **before** `limit`/`offset`
+  - `search(..., limit=0)` returns nothing instead of one hit
+
+
 - **v0.14.0** — Correctness fixes, speed pass, and named snapshots:
   - **Correctness** — several real bugs fixed and locked in with tests:
     - The WAL sidecar path is now derived by suffix (`Path.with_suffix`) instead of `str.replace(".snap", ".wal")`; a database path without `.snap` (e.g. `data.db`) no longer aliases the WAL onto the database file itself (which could append log records into — or delete — the live file)

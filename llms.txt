@@ -5,7 +5,7 @@
 
 ## Identity
 - **Package:** `pysnapdb`
-- **Latest version:** 0.16.0
+- **Latest version:** 0.18.4
 - **Python:** 3.9+
 - **Dependencies:** 0
 - **Repo:** https://github.com/hussain-alsaibai/snapdb
@@ -30,6 +30,19 @@ small operational datasets, agent workflow ledgers.
 - `db.cdc()` — change data capture log
 - `db.vector_index(name, dim=128)` — ANN vector search (v0.16+)
 - `db.profile()` — query profiler
+- `db.replace_schema(schema)` — widen/rewrite the on-disk schema in place
+
+## DocumentStore (v0.18.4)
+```python
+from snapdb.document_store import DocumentStore
+store = DocumentStore("agent.snap")
+store.insert({"step": "plan", "ts": 1})
+store.insert({"step": "act", "ts": 2, "tool": "bash"})   # new field widens the schema
+store.query(sort="ts", limit=10)                          # sorted before slicing
+store.query({"ts": {"$gt": 1}}, select=["step"])
+```
+Absent fields are omitted from returned documents — never `0` / `""`/ `False` —
+and sort last in both directions.
 
 ## MCP server (v0.16+)
 ```python
