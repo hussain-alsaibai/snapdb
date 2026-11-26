@@ -281,9 +281,56 @@ class DocumentStore:
         return self._decode(row)
 
     def update(self, idx: int, doc: Dict[str, Any]) -> None:
-        """Update a document."""
+        """Update a document. Named fields replace; unnamed fields are kept.
+
+        ``update`` used to write ``doc`` as the whole record. Because the row
+        format is fixed-width and ``_decode`` drops the NULL / ``b""``
+        placeholders, every field the caller did not name came back **absent**
+        rather than unchanged:
+
+            db.insert({"name": "alice", "age": 30, "role": "admin"})
+            db.update(0, {"age": 31})
+            db.get(0)   # -> {"age": 31}   the name and role are gone
+
+        Nothing raised. The row still existed and the field the caller meant
+        to change was correct, so the call looked like it had worked -- while
+        the rest of the record had been erased. For a store whose purpose is
+        an append-only agent audit trail, a silent erase is the worst
+        possible failure: the surviving row reads as if the record never had
+        those fields.
+
+        Semantics now match the name: ``update`` is a patch. Fields present in
+        ``doc`` replace their stored value; fields absent from ``doc`` keep
+        the value already on disk. To clear a field, pass it explicitly with
+        ``None`` (or ``drop`` it, if the caller wants it gone from the schema,
+        which a fixed-width row does not support) -- an explicit ``None``
+        stays an explicit null, an unmentioned key stays untouched.
+
+        Use :meth:`replace` to overwrite a whole record.
+        """
         if self._db is None:
             raise RuntimeError("No documents stored yet")
+        current = self.get(idx)
+        if current is None:
+            # An update to a row that does not exist used to write a
+            # placeholder row into the store. Failing loudly is the only
+            # honest answer: the caller's intent was to modify something.
+            raise IndexError(f"no document at index {idx}")
+        merged = dict(current)
+        merged.update(doc)
+        row = self._coerce_document(merged)
+        self._db.update(idx, row)
+
+    def replace(self, idx: int, doc: Dict[str, Any]) -> None:
+        """Overwrite a document entirely. Fields not in ``doc`` are removed.
+
+        This is the behaviour ``update`` used to have. It is spelled
+        separately so that clearing fields is something a caller asks for.
+        """
+        if self._db is None:
+            raise RuntimeError("No documents stored yet")
+        if self.get(idx) is None:
+            raise IndexError(f"no document at index {idx}")
         row = self._coerce_document(doc)
         self._db.update(idx, row)
 

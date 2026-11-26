@@ -668,6 +668,18 @@ on Linux (3.9–3.13) and Windows, and the benchmark on every push and PR.
 
 ## Version History
 
+- **v0.18.5** — `DocumentStore.update()` is a patch:
+  - Passing `{"age": 31}` used to write that dict as the whole record, so
+    `name`, `role` and every other unnamed field came back **erased** — with
+    no error, and the edited field correct. Named fields now replace; unnamed
+    fields keep their stored value; an explicit `None` clears a field
+  - New `replace(idx, doc)` keeps the old whole-record behaviour, so dropping
+    fields is something a caller asks for
+  - Updating a non-existent row raises `IndexError` instead of writing a
+    placeholder row
+  - Known limitation: a real `0` in an integer/float field on a nullable
+    column still reads back as absent (the empty slot and zero share bytes).
+    Strings and booleans are unaffected
 - **v0.18.4** — `DocumentStore` schema growth and honest absence:
   - A store whose first document lacked a field used to drop that field from
     every later insert, silently. The field map now grows, and the new

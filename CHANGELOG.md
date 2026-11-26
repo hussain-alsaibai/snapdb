@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.5] - 2026-11-26
+
+### Fixed
+
+- **`DocumentStore.update()` was a whole-record write with patch syntax.**
+  `update(idx, doc)` wrote `doc` as the entire row. Because the row format is
+  fixed-width and the decoder omits the null placeholders, every field the
+  caller did not name came back *absent*:
+
+  ```python
+  db.insert({"name": "alice", "age": 30, "role": "admin"})
+  db.update(0, {"age": 31})
+  db.get(0)   # -> {"age": 31}    name and role are gone
+  ```
+
+  Nothing raised, the row still existed, and the field the caller meant to
+  change was right. The rest of the record was erased, and the surviving row
+  reads as if it never had those fields -- the worst failure for a store used
+  as an agent audit trail.
+
+  `update` is now a patch: named fields replace, unnamed fields keep their
+  stored value, and an explicit `None` still clears a field. `replace(idx,
+  doc)` provides the old whole-record behaviour for callers who want it.
+
+  Updating a row that does not exist now raises `IndexError` instead of
+  writing a placeholder row. Use `insert` to create a row.
+
+  Thirteen new tests; ten are red against 0.18.4. Every existing test wrote
+  *every* field in the update payload, which is the one spelling where a
+  rewrite and a patch are indistinguishable.
+
+### Known limitation (unchanged, now documented)
+
+An integer or float field set to a real `0` on a nullable column still reads
+back as absent: the empty slot and the value zero are the same bytes, so the
+decoder cannot tell "never written" from "written as 0". Strings and booleans
+are unaffected (`""` and `False` round-trip). Fixing this needs a per-column
+presence sentinel, which changes the on-disk row width -- a schema-level change
+rather than a decode tweak. Tracked, not fixed here.
+
 ## [0.18.4] - 2026-11-23
 
 ### Fixed

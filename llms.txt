@@ -32,7 +32,7 @@ small operational datasets, agent workflow ledgers.
 - `db.profile()` — query profiler
 - `db.replace_schema(schema)` — widen/rewrite the on-disk schema in place
 
-## DocumentStore (v0.18.4)
+## DocumentStore (v0.18.5)
 ```python
 from snapdb.document_store import DocumentStore
 store = DocumentStore("agent.snap")
@@ -40,9 +40,17 @@ store.insert({"step": "plan", "ts": 1})
 store.insert({"step": "act", "ts": 2, "tool": "bash"})   # new field widens the schema
 store.query(sort="ts", limit=10)                          # sorted before slicing
 store.query({"ts": {"$gt": 1}}, select=["step"])
+
+store.update(0, {"step": "replan"})   # PATCH: only "step" changes
+store.replace(0, {"step": "replan"})  # whole record; unnamed fields drop
 ```
 Absent fields are omitted from returned documents — never `0` / `""`/ `False` —
 and sort last in both directions.
+
+`update()` modifies only the keys you pass; every other field keeps its stored
+value. An explicit `None` clears a field. It raises `IndexError` for a row that
+does not exist — use `insert` to create one. Use `replace()` when you mean to
+overwrite the whole record.
 
 ## MCP server (v0.16+)
 ```python
